@@ -1,0 +1,278 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://xdeck.in/schemas/package.schema.json",
+  "title": "xDeck Package Manifest",
+  "description": "Manifest contract for tenants/_packages/<name>/package.json. Locked under ADR 0002 (2026-04-29). Additive over the pre-2026-04-29 schema; existing 5 packages stay valid without modification.",
+  "type": "object",
+  "required": ["namespace", "name", "displayName", "version", "description", "maintainer", "marketplace"],
+  "properties": {
+    "namespace": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{2,31}$",
+      "description": "Builder-owned namespace prefix. Required. Slice A1 enforces against the static allowlist at docs/config/package-namespaces.json; ROADMAP §9.42 replaces that with builder_profile lookups."
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "minLength": 2,
+      "maxLength": 64,
+      "description": "Lowercase kebab-case identifier within the namespace. Qualified id is `<namespace>/<name>`."
+    },
+    "displayName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(-[A-Za-z0-9.-]+)?(\\+[A-Za-z0-9.-]+)?$",
+      "description": "Semver per https://semver.org."
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["theme", "feature", "connector", "blueprint", "entitlement"],
+      "default": "feature",
+      "description": "Install-behaviour discriminator. Existing packages omit this and default to feature. §9.52 — `entitlement` ships NO classes (no per-tenant code execution); the entire feature is centralised behind §9.50 capabilities + a billing block. Adding `entryClass` / `triggers` to an entitlement manifest is rejected at content-validation time."
+    },
+    "system": {
+      "type": "boolean",
+      "default": false,
+      "description": "§9.74 — when true, the package is auto-installed at tenant provisioning (`install_system_packages` step), hidden from tenant marketplace listing, and uninstall is restricted to super_admin (`Force uninstall` with reason). The bar is high — every system package is forced on every tenant forever. Existing packages omit this and stay 100% backward-compatible (defaults false)."
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "maintainer": {
+      "type": "object",
+      "required": ["name", "email"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "email": { "type": "string", "format": "email" }
+      },
+      "additionalProperties": false
+    },
+    "marketplace": {
+      "type": "object",
+      "required": ["category", "tags", "pricing", "status"],
+      "properties": {
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Free-form (e.g. Communication, Reporting, AI, Insights, Localization, Branding, Vertical:Healthcare). Marketplace UI groups by this string."
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "pricing": {
+          "type": "string",
+          "enum": ["free", "paid", "usage-based"]
+        },
+        "featured": { "type": "boolean", "default": false },
+        "status": {
+          "type": "string",
+          "enum": ["alpha", "beta", "stable", "deprecated"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "compatiblePlans": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["free", "starter", "professional", "enterprise", "custom"]
+      },
+      "uniqueItems": true,
+      "default": []
+    },
+    "requiredFeatures": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "default": []
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{2,31}/[a-z][a-z0-9-]*@.+$",
+        "description": "Format: '<namespace>/<name>@<semver-range>', e.g. 'xdeck/theme-clinic@^1.0.0'."
+      },
+      "uniqueItems": true,
+      "default": []
+    },
+    "entryClass": {
+      "type": "string",
+      "description": "Optional. Class loaded by the runtime for this package's primary use case."
+    },
+    "triggers": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "default": []
+    },
+    "entities": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "description": "Legacy flat entity list (still accepted). Prefer provides.entities + requires.entities."
+    },
+    "provides": {
+      "type": "object",
+      "properties": {
+        "entities": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "string", "minLength": 1 },
+              {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string", "minLength": 1 },
+                  "extensible": {
+                    "type": "boolean",
+                    "description": "Slice A2 — when true, the migrator adds a `customFields jsonb DEFAULT '{}'` column so tenants can ship sidecar extensions under tenants/<slug>/entities/extensions/<ns>__<name>.json."
+                  },
+                  "inheritable": {
+                    "type": "boolean",
+                    "description": "Slice A3 — when true, tenants may declare entities that inherit from this one via Joined Table Inheritance (child table whose primary key FKs the parent's, ON DELETE CASCADE)."
+                  },
+                  "sti": {
+                    "type": "object",
+                    "description": "Slice B5 — opts the entity into Single-Table Inheritance. Tenants declare STI children that share this entity's table, distinguished by the discriminator column.",
+                    "required": ["discriminatorColumn", "parentValue"],
+                    "properties": {
+                      "discriminatorColumn": { "type": "string", "minLength": 1 },
+                      "parentValue": { "type": "string", "minLength": 1 }
+                    },
+                    "additionalProperties": false
+                  }
+                },
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "requires": {
+      "type": "object",
+      "properties": {
+        "entities": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "string", "minLength": 1 },
+              {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string", "minLength": 1 },
+                  "extensible": { "type": "boolean" },
+                  "inheritable": { "type": "boolean" }
+                },
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ui": {
+      "type": "object",
+      "properties": {
+        "components": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "description": "Component names contributed to the manifest scanner. Each must have index.tsx + meta.json under components/<Name>/."
+        }
+      },
+      "additionalProperties": false
+    },
+    "tokens": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Path to design tokens JSON. Required when kind == theme."
+    },
+    "surfaces": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "Surface ID -> override descriptor map. Required when kind == theme.",
+      "patternProperties": {
+        "^[a-z][A-Za-z0-9.:_*-]+$": {
+          "type": "object",
+          "required": ["default", "mode"],
+          "properties": {
+            "default": {},
+            "mode": {
+              "type": "string",
+              "enum": ["replace", "merge", "forbid"]
+            },
+            "perEntity": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "config": {
+      "type": "object",
+      "description": "Default config values. Tenants override via packages[].config in tenant config.json."
+    },
+    "configSchema": {
+      "type": "object",
+      "description": "Optional JSON Schema for the package's config field. Validator checks tenant config[].config against this at install time."
+    },
+    "permissions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "default": []
+    },
+    "capabilities": {
+      "type": "object",
+      "description": "§9.50 — runtime-API capability declarations. `required` must be granted at install time; `optional` are individually toggle-able. Each entry must be a known capability per the @xdeck/runtime-api catalogue (e.g. 'email:send', 'entity:read:Patient'). Reserved strings ('event:emit', 'event:listen', 'class:invoke:*') are rejected per §9.50.9.1. Content validation (catalogue + reserved) runs in PackageValidatorService.validate(); AJV here validates shape only.",
+      "properties": {
+        "required": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": []
+        },
+        "optional": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "installHooks": {
+      "type": "object",
+      "properties": {
+        "onInstall": { "type": "string", "minLength": 1 },
+        "onUninstall": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "kind": { "const": "theme" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "required": ["tokens", "surfaces"]
+      }
+    }
+  ]
+}

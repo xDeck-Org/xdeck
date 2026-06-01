@@ -1,0 +1,53 @@
+{
+  "name": "@xdeck/runtime-api",
+  "version": "0.2.0",
+  "description": "§9.50 — capability catalogue + typed `xdeck` runtime global + AST static analyzer. Pure types + closed-set enum + (subpath `./static-analyzer`) pure-Node walker shared by the install-time validator (apps/backend) and the tag-time CI gate (scripts/ci/).",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    },
+    "./static-analyzer": {
+      "types": "./dist/static-analyzer.d.ts",
+      "default": "./dist/static-analyzer.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "test": "jest --passWithNoTests"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "typescript": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.3.0"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "rootDir": "src",
+    "testRegex": ".*\\.spec\\.ts$"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
