@@ -1,0 +1,226 @@
+name: Reusable Package Release CI
+
+# ADR 0003 §6 — gate every xdeck-pkg-* tag against the same hardenings the
+# runtime resolver applies. A tag that fails this workflow is one the resolver
+# would refuse to install; failing fast at tag-push surfaces the problem to
+# the author before any tenant tries to pull it.
+#
+# Called by each xdeck-pkg-* repo's .github/workflows/release.yml on `v*`
+# tag push. Source of truth: scripts/ci/package-content-validator.sh +
+# libs/shared-types/src/package.schema.json (both pulled from this monorepo
+# at the `xdeck-ref` input — pin to a tag in production).
+
+on:
+  workflow_call:
+    inputs:
+      xdeck-ref:
+        description: 'xdeck-org/xdeck git ref to use for schema + content validator (default: main).'
+        required: false
+        default: 'main'
+        type: string
+      max-size-bytes:
+        description: 'Max package tree size in bytes (default: 100 MB).'
+        required: false
+        default: '104857600'
+        type: string
+      typecheck-transforms:
+        description: 'Run tsc --noEmit on classes/transforms/ if present (default: true).'
+        required: false
+        default: true
+        type: boolean
+      capability-gate:
+        description: |
+          §9.50 Phase B Slice 7 — capability-mismatch gate. `fail` blocks the
+          tag on undeclared / unresolvable `xdeck.*` calls. `warn` runs the
+          check but never fails (bootstrap window). `off` skips the check
+          entirely.
+        required: false
+        default: 'fail'
+        type: string
+      coverage-gate:
+        description: |
+          Release coverage gate (Salesforce-style). A code-bearing package must
+          have test coverage ≥ the platform standard (statements/functions/lines
+          ≥ 80, branches ≥ 75 — same as coverage-check.yml) before its tag is
+          accepted. Data-only packages (no .ts/.tsx) pass-by-E2E via the
+          per-package install round-trip. `fail` blocks the tag; `warn` reports
+          the gap but never fails (bootstrap window while packages grow tests);
+          `off` skips it. Default `warn` — flip to `fail` once package repos
+          ship test suites.
+        required: false
+        default: 'warn'
+        type: string
+    secrets:
+      xdeck-checkout-token:
+        description: 'PAT with read access to xdeck-org/xdeck. Optional — defaults to the repo''s GITHUB_TOKEN if both repos are in the same org with appropriate sharing.'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout package repo
+        uses: actions/checkout@v4
+        with:
+          path: pkg
+          fetch-depth: 1
+
+      - name: Checkout xdeck monorepo (schema + validator)
+        uses: actions/checkout@v4
+        with:
+          repository: xdeck-org/xdeck
+          ref: ${{ inputs.xdeck-ref }}
+          path: xdeck
+          token: ${{ secrets.xdeck-checkout-token || github.token }}
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install ajv-cli
+        run: npm install -g ajv-cli@5
+
+      - name: Validate package.json against schema
+        run: |
+          if [ ! -f pkg/package.json ]; then
+            echo "❌ pkg/package.json missing" >&2
+            exit 1
+          fi
+          ajv validate \
+            -s xdeck/libs/shared-types/src/package.schema.json \
+            -d pkg/package.json \
+            --strict=false
+          echo "✅ Manifest validates against package.schema.json"
+
+      - name: Validate entity DSL (entities/*.entity.json)
+        # Closes the gap that let xdeck-pkg-retail@v0.1.0 ship with an invalid
+        # `numeric(12,2)` column type: the release CI validated the MANIFEST but
+        # never the ENTITY DSL, so a package whose tables can't be created still
+        # tagged green. ajv against entity-dsl.schema.json is the structural
+        # pre-release test for every provided entity.
+        run: |
+          if compgen -G "pkg/entities/*.entity.json" > /dev/null; then
+            for f in pkg/entities/*.entity.json; do
+              echo "→ $f"
+              ajv validate -s xdeck/libs/shared-types/src/entity-dsl.schema.json -d "$f" --strict=false
+            done
+            echo "✅ All entity DSL files validate against entity-dsl.schema.json"
+          else
+            echo "ℹ️  No entities/ — skipping entity-DSL validation."
+          fi
+
+      - name: Cross-check tag version vs manifest version
+        run: |
+          MANIFEST_VERSION=$(node -p "require('./pkg/package.json').version")
+          # GitHub sets ref like 'refs/tags/v1.2.3' — strip the prefix + 'v'.
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          if [ "$MANIFEST_VERSION" != "$TAG_VERSION" ]; then
+            echo "❌ Tag version 'v${TAG_VERSION}' disagrees with manifest version '${MANIFEST_VERSION}'." >&2
+            echo "   Tagging convention: v<manifest.version>. Bump the manifest, retag, and push." >&2
+            exit 1
+          fi
+          echo "✅ Tag version v${TAG_VERSION} matches manifest version ${MANIFEST_VERSION}"
+
+      - name: Cross-check folder layout consistency
+        run: |
+          # Manifest namespace+name must match the upstream repo's expected
+          # naming convention: xdeck-org/xdeck-pkg-<name>. Catch authors who
+          # forked a repo and forgot to rename.
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          MANIFEST_NAME=$(node -p "require('./pkg/package.json').name")
+          MANIFEST_NS=$(node -p "require('./pkg/package.json').namespace")
+          EXPECTED_REPO="xdeck-pkg-${MANIFEST_NAME}"
+          if [ "$REPO_NAME" != "$EXPECTED_REPO" ]; then
+            echo "⚠️  Repo name '${REPO_NAME}' deviates from the convention '${EXPECTED_REPO}'." >&2
+            echo "   ADR 0003 §4 — upstream URL is computed as xdeck-pkg-<name>; non-conforming repos need a repoUrlOverride row in package_repos." >&2
+            # Soft warning — don't fail. Repo name overrides exist by design.
+          fi
+          echo "ℹ️  Repo: ${REPO_NAME}  Manifest: ${MANIFEST_NS}/${MANIFEST_NAME}"
+
+      - name: Content hardenings (symlinks/submodules/LFS/.gitattributes/size)
+        run: bash xdeck/scripts/ci/package-content-validator.sh pkg --max-size-bytes ${{ inputs.max-size-bytes }}
+
+      - name: Type-check classes/transforms (if present)
+        if: ${{ inputs.typecheck-transforms }}
+        run: |
+          if compgen -G "pkg/classes/transforms/*.ts" > /dev/null; then
+            echo "→ Type-checking classes/transforms/"
+            cd pkg
+            npx -y -p typescript@5 -p '@types/node@20' tsc \
+              --noEmit --strict --skipLibCheck --target ES2022 --module commonjs \
+              --moduleResolution node --esModuleInterop --resolveJsonModule \
+              classes/transforms/*.ts
+            echo "✅ classes/transforms/ type-check clean"
+          else
+            echo "ℹ️  No classes/transforms/ — skipping type-check."
+          fi
+
+      - name: Build @xdeck/runtime-api (analyzer + types)
+        if: ${{ inputs.capability-gate != 'off' }}
+        working-directory: xdeck/libs/runtime-api
+        run: npm install --no-audit --no-fund && npm run build
+
+      - name: Static analysis — capability declaration cross-check
+        if: ${{ inputs.capability-gate != 'off' }}
+        env:
+          CAPABILITY_GATE: ${{ inputs.capability-gate }}
+        # §9.50 Phase B Slice 7 — runs the SAME analyzer the install-time
+        # validator uses (apps/backend → @xdeck/runtime-api/static-analyzer).
+        # Findings are emitted as `PACKAGE_CAPABILITY_UNDECLARED` /
+        # `PACKAGE_CAPABILITY_USAGE_UNRESOLVABLE` — identical vocabulary to
+        # install-time, so authors see one consistent error class regardless
+        # of where they hit it. `warn` mode soft-fails (no exit 1) so the
+        # bootstrap window can catch up before the gate goes binding.
+        run: |
+          set +e
+          node xdeck/scripts/ci/check-package-capabilities.js pkg
+          rc=$?
+          if [ "$rc" -ne 0 ] && [ "${CAPABILITY_GATE}" = "warn" ]; then
+            echo "::warning::capability mismatch — soft-fail mode (CAPABILITY_GATE=warn)"
+            exit 0
+          fi
+          exit $rc
+
+      - name: Release coverage gate (≥ 80% on code-bearing packages)
+        if: ${{ inputs.coverage-gate != 'off' }}
+        env:
+          COVERAGE_GATE: ${{ inputs.coverage-gate }}
+        # Salesforce-style: no code without coverage gets released. A package
+        # that ships a `test:cov` script runs it and is gated on the produced
+        # coverage-summary.json; a data-only package (no .ts/.tsx) passes-by-E2E
+        # (the per-package install round-trip in package-install.e2e-spec).
+        # `warn` reports the gap during the bootstrap window without blocking;
+        # `fail` blocks the tag.
+        run: |
+          set +e
+          PKG_NAME=$(node -p "require('./pkg/package.json').namespace + '/' + require('./pkg/package.json').name")
+          SUMMARY=""
+          if node -e "process.exit(require('./pkg/package.json').scripts && require('./pkg/package.json').scripts['test:cov'] ? 0 : 1)"; then
+            echo "→ Package ships a test:cov script — running it for coverage."
+            ( cd pkg && npm ci --no-audit --no-fund && npm run test:cov )
+            if [ -f pkg/coverage/coverage-summary.json ]; then SUMMARY="--coverage-summary pkg/coverage/coverage-summary.json"; fi
+          else
+            echo "ℹ️  No test:cov script — gate decides via code/data-only detection."
+          fi
+          node xdeck/scripts/ci/coverage-gate.js $SUMMARY --target pkg --label "$PKG_NAME"
+          rc=$?
+          if [ "$rc" -ne 0 ] && [ "${COVERAGE_GATE}" = "warn" ]; then
+            echo "::warning::coverage below release threshold — soft-fail mode (COVERAGE_GATE=warn). Add tests before this flips to fail."
+            exit 0
+          fi
+          exit $rc
+
+      - name: Summary
+        run: |
+          echo "## Release CI summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Tag: \`${GITHUB_REF#refs/tags/}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Repo: \`${GITHUB_REPOSITORY}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- xdeck-ref used: \`${{ inputs.xdeck-ref }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- capability-gate: \`${{ inputs.capability-gate }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- coverage-gate: \`${{ inputs.coverage-gate }}\` (≥80/75/80/80; data-only ⇒ pass-by-E2E)" >> $GITHUB_STEP_SUMMARY
+          echo "- All hardenings (manifest schema, version cross-check, content validator, capability declarations, release coverage) checked." >> $GITHUB_STEP_SUMMARY

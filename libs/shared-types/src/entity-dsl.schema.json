@@ -1,0 +1,243 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://xdeck.in/schemas/entity-dsl.json",
+  "title": "xDeck Entity DSL (§9.24)",
+  "description": "Schema for entity JSON files. Applies to packaged entities at tenants/_packages/<pkg>/entities/<name>.entity.json AND tenant entities at tenants/<slug>/entities/definitions/<name>.json. Validated by EntityMigratorService + TenantEntityRegistryService at install / load time. Slices A1–B7.",
+  "type": "object",
+  "required": ["columns"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-zA-Z][a-zA-Z0-9_-]*$",
+      "description": "Logical entity name (camelCase or kebab-case). Optional in the schema — the migrator auto-fills from the filename for packaged entities, and tenant entities are checked downstream by TenantEntityRegistryService.coerceShape. IDE tooling should still surface this field for tenants."
+    },
+    "tableName": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Physical table name (pre-namespace). Migrator prefixes packaged entities with <namespace_underscored>__."
+    },
+    "table": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Legacy alias for `tableName` — the migrator accepts either, with `tableName` taking precedence if both are set."
+    },
+    "description": { "type": "string" },
+    "columns": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "Map of column name → column definition. Slice A1 supports the column types the 5 sample fixtures use; unsupported types throw at install time.",
+      "additionalProperties": { "$ref": "#/definitions/column" }
+    },
+    "indexes": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/index" }
+    },
+    "uniques": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["columns"],
+        "additionalProperties": false,
+        "properties": {
+          "columns": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 }
+        }
+      }
+    },
+    "inheritance": { "$ref": "#/definitions/inheritance" },
+    "inherits": { "$ref": "#/definitions/inherits" },
+    "relations": {
+      "type": "object",
+      "description": "Slice B4 — per-field relation DSL. Only meaningful at runtime; the migrator splices these into EntitySchema.options.relations.",
+      "additionalProperties": { "$ref": "#/definitions/relation" }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "column": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "description": "Column SQL type. Accepts the slice-A1 union plus the `varchar(N)` shorthand. Unsupported types fail at install with PACKAGE_ENTITY_MIGRATION_FAILED.",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "uuid",
+                "varchar",
+                "char",
+                "text",
+                "integer",
+                "int",
+                "bigint",
+                "smallint",
+                "boolean",
+                "bool",
+                "timestamp",
+                "timestamptz",
+                "date",
+                "time",
+                "jsonb",
+                "json",
+                "numeric",
+                "decimal",
+                "real",
+                "double precision"
+              ]
+            },
+            { "type": "string", "pattern": "^varchar\\(\\d+\\)$" }
+          ]
+        },
+        "length": { "type": "integer", "minimum": 1 },
+        "precision": { "type": "integer", "minimum": 1 },
+        "scale": { "type": "integer", "minimum": 0 },
+        "nullable": { "type": "boolean" },
+        "unique": { "type": "boolean" },
+        "default": {
+          "description": "Column default. Strings ending in `()` (e.g. `now()`) emit as raw SQL; quoted strings (`'sent'`) unwrap to literals. Numbers / booleans pass through.",
+          "type": ["string", "number", "boolean", "null"]
+        },
+        "primary": { "type": "boolean" },
+        "generated": { "type": "string", "enum": ["uuid", "increment", "rowid"] },
+        "array": { "type": "boolean" },
+        "enum": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+        "comment": { "type": "string" },
+        "transforms": { "$ref": "#/definitions/transformsBlock" }
+      }
+    },
+    "index": {
+      "type": "object",
+      "required": ["columns"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "columns": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+        "unique": { "type": "boolean" }
+      }
+    },
+    "inheritance": {
+      "type": "object",
+      "required": ["extends"],
+      "additionalProperties": false,
+      "description": "Tenant-side inheritance from a packaged entity. JTI (slice A3) gives the child its own table + FK; STI (slice B5) shares the parent's table; FLAT (§9.40) flattens parent columns into a concrete child table at migration time (no FK, no shared table — child is a runtime-independent copy).",
+      "properties": {
+        "extends": {
+          "type": "string",
+          "description": "Qualified parent entity id `<namespace>/<entityName>`.",
+          "pattern": "^[a-z][a-z0-9-]*\\/[A-Za-z][A-Za-z0-9_-]*$"
+        },
+        "strategy": {
+          "type": "string",
+          "enum": ["JTI", "STI", "FLAT"],
+          "default": "JTI"
+        },
+        "discriminator": {
+          "type": "object",
+          "required": ["value"],
+          "additionalProperties": false,
+          "description": "Required when strategy is 'STI'. The value this child carries in the parent's discriminator column.",
+          "properties": {
+            "value": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "inherits": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "§9.40 — opt-in flags governing what the child receives from the parent under FLAT inheritance. Ignored for JTI / STI strategies (they have their own inheritance shape).",
+      "properties": {
+        "sharingRules": {
+          "type": "boolean",
+          "description": "When true, parent's sharing rules apply to the child via OR-merge with the child's own. Default false (child enforces its own rules only). Hookup into SharingRuleEngine is a follow-up — today the flag is preserved on the def but not yet consulted at query time."
+        },
+        "triggers": {
+          "type": "boolean",
+          "description": "When true, parent's column-level transforms (`beforeWrite` / `afterRead`) propagate onto inherited columns the child did not redefine. Default false (child gets bare column types only)."
+        }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "required": ["type", "target"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["one-to-one", "one-to-many", "many-to-one", "many-to-many"]
+        },
+        "target": { "type": "string", "minLength": 1 },
+        "targetScope": { "type": "string", "enum": ["standard", "custom", "shared"] },
+        "eager": { "type": "boolean" },
+        "nullable": { "type": "boolean" },
+        "inverseField": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Required for `type: 'one-to-many'` — name of the field on the inverse side."
+        },
+        "joinTable": {
+          "description": "Required for `type: 'many-to-many'`. Bare string is shorthand for `{ name }`.",
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            {
+              "type": "object",
+              "required": ["name"],
+              "additionalProperties": false,
+              "properties": { "name": { "type": "string", "minLength": 1 } }
+            }
+          ]
+        },
+        "onDelete": { "type": "string", "enum": ["cascade", "set null", "restrict"] }
+      }
+    },
+    "transformsBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Slice B2 — per-column transform pipeline. `beforeWrite` fires on insert/update; `afterRead` fires on load.",
+      "properties": {
+        "beforeWrite": { "type": "array", "items": { "$ref": "#/definitions/transformSpec" } },
+        "afterRead": { "type": "array", "items": { "$ref": "#/definitions/transformSpec" } }
+      }
+    },
+    "transformSpec": {
+      "description": "Either a transform name (string shorthand) or `{ transform, unless?, method?, mode?, from? }`.",
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "object",
+          "required": ["transform"],
+          "additionalProperties": false,
+          "properties": {
+            "transform": { "type": "string", "minLength": 1 },
+            "unless": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "role": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 }
+              }
+            },
+            "method": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Class method name — only meaningful for `class:*` transforms (slice B6). Defaults to 'transform'."
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["pure", "sandbox"],
+              "description": "Class execution mode — only meaningful for `class:*`. 'sandbox' is reserved for slice B6.b."
+            },
+            "from": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]*\\/[a-z][a-z0-9-]*$",
+              "description": "§9.24 (1b) — cross-package source `<namespace>/<packageName>`. Only meaningful for `class:*` transforms; resolves the class file under that package's classes/transforms/ directory instead of the declaring scope."
+            }
+          }
+        }
+      ]
+    }
+  }
+}
