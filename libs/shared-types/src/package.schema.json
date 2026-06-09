@@ -39,6 +39,11 @@
       "default": false,
       "description": "§9.74 — when true, the package is auto-installed at tenant provisioning (`install_system_packages` step), hidden from tenant marketplace listing, and uninstall is restricted to super_admin (`Force uninstall` with reason). The bar is high — every system package is forced on every tenant forever. Existing packages omit this and stay 100% backward-compatible (defaults false)."
     },
+    "reversible": {
+      "type": "boolean",
+      "default": true,
+      "description": "IRREVERTABLE packages (when false): can be installed ONCE on a tenant but can NEVER be uninstalled — `uninstall` hard-fails with PACKAGE_IRREVERSIBLE regardless of role/force. For system-of-record packages whose tables hold data that must persist (identity, audit/compliance, financial ledgers, vertical entity packs once they carry customer data) — uninstalling would be silent data loss. The only way to remove the data is to deprovision the whole tenant. Defaults true (normal install/uninstall). A `false` opt-in should be paired with a loud install-time confirmation. CI tests an irrevertable package via provision→install→deprovision, never install→uninstall."
+    },
     "description": {
       "type": "string",
       "minLength": 1,
@@ -188,9 +193,40 @@
       "properties": {
         "components": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
-          "uniqueItems": true,
-          "description": "Component names contributed to the manifest scanner. Each must have index.tsx + meta.json under components/<Name>/."
+          "items": {
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "description": "Legacy bare-name form. Each must have index.tsx + meta.json under components/<Name>/."
+              },
+              {
+                "type": "object",
+                "required": ["name", "slot", "file"],
+                "description": "Slot-mounted contribution. The host shell iterates installed packages and mounts every component whose `slot` matches a registered shell slot (e.g. `root-providers`). Used by `standard/telemetry` to bootstrap the browser SDK without tenant repos bundling it directly.",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Display name of the component (e.g. `TelemetryProvider`)."
+                  },
+                  "slot": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Host-shell slot id this component mounts at. Reserved slots: `root-providers` (top of React tree, before routing); host shell rejects unknown slots at load time."
+                  },
+                  "file": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Path to the component source, relative to the package root (e.g. `ui/TelemetryProvider.tsx`)."
+                  },
+                  "description": { "type": "string" }
+                },
+                "additionalProperties": false
+              }
+            ]
+          },
+          "description": "Component contributions. Bare strings are the legacy `components/<Name>/` lookup; object entries declare slot-mounted contributions resolved by the host shell."
         }
       },
       "additionalProperties": false
@@ -229,6 +265,54 @@
       "type": "object",
       "description": "Optional JSON Schema for the package's config field. Validator checks tenant config[].config against this at install time."
     },
+    "settingsSchema": {
+      "type": "object",
+      "description": "§9.80 — typed, owner-editable post-install settings + secrets descriptor. The platform renders a uniform form from `fields` (§9.81 <SchemaForm>), validates submitted values, persists non-secret values per-tenant in tenant_package_setting.values, and routes `secret` fields into the per-tenant encrypted vault. Distinct from `configSchema` (JSON-Schema for the runtime `config` block). PackageValidatorService.checkSettingsSchema runs the deeper per-field shape check via validateConfigSchema; AJV here validates the outer shape.",
+      "required": ["fields"],
+      "properties": {
+        "version": { "type": "integer", "minimum": 1 },
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["key", "label", "type"],
+            "properties": {
+              "key": { "type": "string", "minLength": 1, "maxLength": 255 },
+              "label": { "type": "string", "minLength": 1 },
+              "type": {
+                "type": "string",
+                "enum": ["string", "secret", "number", "boolean", "select", "multiselect", "textarea", "url", "color"]
+              },
+              "secret": { "type": "boolean" },
+              "required": { "type": "boolean" },
+              "description": { "type": "string" },
+              "placeholder": { "type": "string" },
+              "default": { "type": ["string", "number", "boolean", "null"] },
+              "options": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["value", "label"],
+                  "properties": {
+                    "value": { "type": "string" },
+                    "label": { "type": "string" }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "group": { "type": "string" },
+              "min": { "type": "number" },
+              "max": { "type": "number" },
+              "minLength": { "type": "number" },
+              "maxLength": { "type": "number" },
+              "pattern": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "permissions": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },
@@ -250,6 +334,13 @@
           "items": { "type": "string", "minLength": 1 },
           "uniqueItems": true,
           "default": []
+        },
+        "provides": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": [],
+          "description": "Runtime-API capabilities this package EMITS — exposes via the §9.50 `xdeck.*` global to other installed packages running in the same tenant. The host's capability bridge enforces grants per consumer; declaring a capability here is the supply side. Used by `standard/telemetry` so any installed package can call `xdeck.telemetry.track(...)` without bundling the SDK directly."
         }
       },
       "additionalProperties": false
@@ -259,6 +350,65 @@
       "properties": {
         "onInstall": { "type": "string", "minLength": 1 },
         "onUninstall": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "tenant_docs_contributions": {
+      "type": "array",
+      "description": "§9.54 — declarative tenant-doc updates applied to the tenant's _ai/*.md files on install (insert_or_update removed on uninstall; append is write-once). Sanctioned paths, per-path operation rules, and the 500-char cap are enforced by TenantDocsContributionValidator; AJV here validates shape only.",
+      "items": {
+        "type": "object",
+        "required": ["target_file", "anchor_id", "operation", "content_path"],
+        "properties": {
+          "target_file": { "type": "string", "minLength": 1 },
+          "section": { "type": "string", "minLength": 1 },
+          "anchor_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "operation": { "type": "string", "enum": ["insert_or_update", "append"] },
+          "content_path": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "description": "§9.50 RA3 — declared telemetry events this package emits. Tenant admins can audit the catalogue before install (DPDP / GDPR readiness); ingest-side validation (RA5) consumes the same declarations to reject malformed payloads. Builders who emit events should declare them here; future codegen targets emit `.d.ts` types from this block so `xdeck.telemetry.track()` is type-checked against the per-package catalogue.",
+      "properties": {
+        "events": {
+          "type": "object",
+          "description": "Map of event name → declaration. Event names are namespaced by the package itself — declaring `appointment_booked` here from `acme/booking-flow` produces the qualified id `acme/booking-flow#appointment_booked` in the catalogue, preventing cross-package name collisions.",
+          "patternProperties": {
+            "^[a-z][a-zA-Z0-9_]*$": {
+              "type": "object",
+              "required": ["schema", "description"],
+              "properties": {
+                "schema": {
+                  "type": "object",
+                  "description": "JSON Schema (draft-07-compatible) for the event payload. AJV-validated at publish + ingest time. Authors should declare every field the SDK will receive; unknown fields are rejected by the server-side scrubber."
+                },
+                "description": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "description": "One-line explanation of when this event fires + what it represents. Shown in the tenant admin event-catalog UI."
+                },
+                "retentionDays": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 3650,
+                  "description": "Override the package-level retention for this specific event. Useful when a regulatory boundary requires (e.g.) a 7-year retention on `prescription_dispensed` even when the rest of the package retains 30 days."
+                },
+                "category": {
+                  "type": "string",
+                  "enum": ["essential", "performance", "behavioural", "diagnostic", "marketing"],
+                  "description": "Privacy / consent category. Maps to the tenant's `standard/telemetry` `config.consent.categories` allowlist so a tenant can opt out of `marketing` events without disabling `essential` ones."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false,
+          "description": "Keys must match the event-name pattern `^[a-z][a-zA-Z0-9_]*$`."
+        }
       },
       "additionalProperties": false
     }
