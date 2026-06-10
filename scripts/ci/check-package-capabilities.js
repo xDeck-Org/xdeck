@@ -38,20 +38,28 @@ function die(msg, code = 2) {
 function findMonorepoRoot(startDir) {
   let dir = startDir;
   while (dir !== path.dirname(dir)) {
-    if (fs.existsSync(path.join(dir, 'package.json')) && fs.existsSync(path.join(dir, 'tenants'))) return dir;
+    // libs/runtime-api exists in both the full monorepo and the vendored release
+    // hub; tenants/ is monorepo-only (the hub mirror omits it).
+    if (fs.existsSync(path.join(dir, 'libs', 'runtime-api'))) return dir;
     dir = path.dirname(dir);
   }
   return null;
 }
 
 function loadAnalyzer(monorepoRoot) {
-  const directPath = path.join(monorepoRoot, 'node_modules', '@xdeck', 'runtime-api', 'dist', 'static-analyzer.js');
-  try {
-    // Prefer the explicit dist file — survives node-classic resolution
-    // + works regardless of the `exports` subpath map.
-    if (fs.existsSync(directPath)) return require(directPath);
-  } catch (_err) {
-    /* fall through */
+  // Resolve the analyzer in both layouts: the full monorepo installs it under
+  // node_modules/@xdeck; the vendored release hub builds it in place at
+  // libs/runtime-api/dist (no root node_modules symlink).
+  const directPaths = [
+    path.join(monorepoRoot, 'node_modules', '@xdeck', 'runtime-api', 'dist', 'static-analyzer.js'),
+    path.join(monorepoRoot, 'libs', 'runtime-api', 'dist', 'static-analyzer.js')
+  ];
+  for (const directPath of directPaths) {
+    try {
+      if (fs.existsSync(directPath)) return require(directPath);
+    } catch (_err) {
+      /* fall through */
+    }
   }
   try {
     return require('@xdeck/runtime-api/static-analyzer');
