@@ -1,0 +1,168 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://xdeck.in/schemas/observability-config.schema.json",
+  "title": "xDeck Tenant Observability Config",
+  "description": "Validates the `observability.logging` block inside `tenants/<slug>/config.json` per env (per §9.46.2 branching). §9.49 Slice 4.",
+  "type": "object",
+  "required": ["enabled"],
+  "additionalProperties": false,
+  "properties": {
+    "enabled": {
+      "type": "boolean",
+      "default": false,
+      "description": "Master switch. When false, the §9.49 pipeline silently drops every emit for this tenant; per-source toggles ignored. Opt-in per §9.49.2."
+    },
+    "default_level": {
+      "type": "string",
+      "enum": ["debug", "info", "warn", "error"],
+      "default": "warn",
+      "description": "Default ingest level when a source has no explicit level."
+    },
+    "retention_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 365,
+      "default": 30,
+      "description": "Hot-store retention before archival. Plan-gated; values above the plan's `PLAN_LOG_RETENTION` cap are clamped at boot (Slice 5)."
+    },
+    "ingest_cap_mb_per_day": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000,
+      "default": 500,
+      "description": "Per-day ingest cap. Plan-gated; exceeding the cap drops further events with a `cap-exceeded` audit row (Slice 5)."
+    },
+    "redact_patterns": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["id", "pattern"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,63}$",
+            "description": "Stable rule id (kebab-case). Per-tenant rules with the SAME id replace a default."
+          },
+          "pattern": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "flags": {
+            "type": "string",
+            "pattern": "^[gimsuy]*$",
+            "description": "Regex flags. The redactor always force-adds `g` for replaceAll-style behaviour."
+          },
+          "replacement": {
+            "type": "string",
+            "default": "[redacted]"
+          }
+        }
+      }
+    },
+    "sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "core": {
+          "$ref": "#/definitions/sourceToggle"
+        },
+        "tenant-class": {
+          "$ref": "#/definitions/sourceToggle"
+        },
+        "packages": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "default": {
+              "$ref": "#/definitions/sourceToggle"
+            }
+          },
+          "patternProperties": {
+            "^[a-z][a-z0-9-]{2,31}/[a-z][a-z0-9-]*$": {
+              "$ref": "#/definitions/sourceToggle"
+            }
+          },
+          "description": "Per-package overrides keyed by qualified id (`<namespace>/<name>`). `default` applies to packages with no explicit override."
+        }
+      }
+    },
+    "export": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "formats": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": ["json", "ndjson", "csv"]
+          },
+          "default": ["json", "ndjson"]
+        },
+        "max_lines_per_export": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000,
+          "default": 100000
+        },
+        "webhook_forward": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false
+            },
+            "endpoint": {
+              "type": "string",
+              "format": "uri",
+              "description": "Required when enabled=true. HTTPS only per §9.49 Slice 12."
+            },
+            "auth_header": {
+              "type": "string",
+              "maxLength": 256,
+              "description": "Optional bearer / API key header sent with every batch."
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                },
+                "required": ["enabled"]
+              },
+              "then": {
+                "required": ["endpoint"]
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "definitions": {
+    "sourceToggle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "level": {
+          "type": "string",
+          "enum": ["debug", "info", "warn", "error"]
+        }
+      }
+    }
+  }
+}

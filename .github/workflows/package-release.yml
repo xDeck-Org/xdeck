@@ -41,7 +41,7 @@ on:
         description: |
           Release coverage gate (Salesforce-style). A code-bearing package must
           have test coverage ≥ the platform standard (statements/functions/lines
-          ≥ 80, branches ≥ 75 — same as coverage-check.yml) before its tag is
+          ≥ 80, branches ≥ 75 — the thresholds the backend's own unit run enforces) before its tag is
           accepted. Data-only packages (no .ts/.tsx) pass-by-E2E via the
           per-package install round-trip. `fail` blocks the tag; `warn` reports
           the gap but never fails (bootstrap window while packages grow tests);
@@ -61,26 +61,33 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    # The caller's repo pays for this job. Without a ceiling a hung run costs it 360 minutes.
+    timeout-minutes: 15
     steps:
       - name: Checkout package repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           path: pkg
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Checkout xdeck monorepo (schema + validator)
-        uses: actions/checkout@v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           repository: xdeck-org/xdeck
           ref: ${{ inputs.xdeck-ref }}
           path: xdeck
           token: ${{ secrets.xdeck-checkout-token || github.token }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: '20'
+          # The platform's Node line. This workflow runs in a package repository, where the
+          # platform's .nvmrc exists only as xdeck/.nvmrc after the checkout above, so the number
+          # stays here; the platform's Node-line gate (scripts/ci/check-node-line.js) holds it to .nvmrc.
+          node-version: '22'
 
       - name: Install ajv-cli
         run: npm install -g ajv-cli@5
@@ -114,6 +121,23 @@ jobs:
             echo "ℹ️  No entities/ — skipping entity-DSL validation."
           fi
 
+      - name: Privacy lint — a record about a person can be joined on that person
+        # A record kept about one person (a family dependent, say) must name that person, not only
+        # whoever was signed in, or one account holder reads another's records. The lint the
+        # monorepo's push gate runs, on this package alone: one node run, no install. Its one
+        # exemption is keyed by the package's own name, so it holds in this checkout; a package
+        # that provides entities and has none here to read is refused.
+        run: node xdeck/scripts/lint-engagement-subject.js --strict --package pkg
+
+      - name: Sharing rules decide by permission, never by a role name, and the package states the platform level they need
+        # A rule that lists role names lets through a role merely named like a built-in one and keeps
+        # out a custom role the deck gave the same permission, and a deck administrator cannot correct
+        # it: they grant permissions, they do not edit a package's rules. The lint the monorepo's push
+        # gate runs, on this package alone: one node run, no install. A rule it cannot read fails.
+        # It also holds the package to the platform level its rules need (requires.platform), so
+        # that an older backend refuses the package instead of running its rules wrong.
+        run: node xdeck/scripts/lint-package-sharing-roles.js --gate --package pkg
+
       - name: Cross-check tag version vs manifest version
         run: |
           MANIFEST_VERSION=$(node -p "require('./pkg/package.json').version")
@@ -143,7 +167,9 @@ jobs:
           echo "ℹ️  Repo: ${REPO_NAME}  Manifest: ${MANIFEST_NS}/${MANIFEST_NAME}"
 
       - name: Content hardenings (symlinks/submodules/LFS/.gitattributes/size)
-        run: bash xdeck/scripts/ci/package-content-validator.sh pkg --max-size-bytes ${{ inputs.max-size-bytes }}
+        env:
+          MAX_SIZE_BYTES: ${{ inputs.max-size-bytes }}
+        run: bash xdeck/scripts/ci/package-content-validator.sh pkg --max-size-bytes "$MAX_SIZE_BYTES"
 
       - name: Type-check classes/transforms (if present)
         if: ${{ inputs.typecheck-transforms }}
@@ -151,7 +177,7 @@ jobs:
           if compgen -G "pkg/classes/transforms/*.ts" > /dev/null; then
             echo "→ Type-checking classes/transforms/"
             cd pkg
-            npx -y -p typescript@5 -p '@types/node@20' tsc \
+            npx -y -p typescript@5 -p '@types/node@22' tsc \
               --noEmit --strict --skipLibCheck --target ES2022 --module commonjs \
               --moduleResolution node --esModuleInterop --resolveJsonModule \
               classes/transforms/*.ts
@@ -169,12 +195,16 @@ jobs:
         if: ${{ inputs.capability-gate != 'off' }}
         env:
           CAPABILITY_GATE: ${{ inputs.capability-gate }}
-        # §9.50 Phase B Slice 7 — runs the SAME analyzer the install-time
-        # validator uses (apps/backend → @xdeck/runtime-api/static-analyzer).
-        # Findings are emitted as `PACKAGE_CAPABILITY_UNDECLARED` /
+        # §9.50 Phase B Slice 7 — runs the SAME analyzer, in the same one
+        # reading, the install-time validator uses (apps/backend →
+        # @xdeck/runtime-api/static-analyzer): every class under `classes/`,
+        # in both call forms (`xdeck().<domain>.<method>(...)` and
+        # `xdeck.<domain>.<method>(...)`). Findings are emitted as
+        # `PACKAGE_CAPABILITY_UNDECLARED` /
         # `PACKAGE_CAPABILITY_USAGE_UNRESOLVABLE` — identical vocabulary to
         # install-time, so authors see one consistent error class regardless
-        # of where they hit it. `warn` mode soft-fails (no exit 1) so the
+        # of where they hit it. A computed id marked
+        # `xdeck-capability-dynamic:` passes and is listed in the step summary. `warn` mode soft-fails (no exit 1) so the
         # bootstrap window can catch up before the gate goes binding.
         run: |
           set +e
@@ -216,11 +246,16 @@ jobs:
           exit $rc
 
       - name: Summary
+        # The inputs come through env: a value pasted into the script would run as script text.
+        env:
+          XDECK_REF: ${{ inputs.xdeck-ref }}
+          CAPABILITY_GATE: ${{ inputs.capability-gate }}
+          COVERAGE_GATE: ${{ inputs.coverage-gate }}
         run: |
           echo "## Release CI summary" >> $GITHUB_STEP_SUMMARY
           echo "- Tag: \`${GITHUB_REF#refs/tags/}\`" >> $GITHUB_STEP_SUMMARY
           echo "- Repo: \`${GITHUB_REPOSITORY}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- xdeck-ref used: \`${{ inputs.xdeck-ref }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- capability-gate: \`${{ inputs.capability-gate }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- coverage-gate: \`${{ inputs.coverage-gate }}\` (≥80/75/80/80; data-only ⇒ pass-by-E2E)" >> $GITHUB_STEP_SUMMARY
-          echo "- All hardenings (manifest schema, version cross-check, content validator, capability declarations, release coverage) checked." >> $GITHUB_STEP_SUMMARY
+          echo "- xdeck-ref used: \`${XDECK_REF}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- capability-gate: \`${CAPABILITY_GATE}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- coverage-gate: \`${COVERAGE_GATE}\` (≥80/75/80/80; data-only ⇒ pass-by-E2E)" >> $GITHUB_STEP_SUMMARY
+          echo "- All hardenings (manifest and entity schemas, privacy lint, sharing-rule lint, version cross-check, content validator, capability declarations, release coverage) checked." >> $GITHUB_STEP_SUMMARY

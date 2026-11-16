@@ -1,0 +1,53 @@
+name: Reusable Package Publish
+
+# After a package tag has passed package-release.yml, publish the GitHub Release for it. The
+# platform's GitHub App then gets the `release` webhook, which is how the registry records the new
+# version for the marketplace (PackageRegistrySyncService.recordLatestRelease). GitHub delivers that
+# webhook for a release made with GITHUB_TOKEN; it holds back only new workflow runs.
+#
+# A separate workflow, and not a job in package-release.yml, because a package repository's token is
+# read-only by default and a called workflow cannot ask for more than its caller granted: a
+# `contents: write` job in package-release.yml would make every caller's run invalid at startup,
+# validation included. Here, a package that has not added this job simply publishes no Release.
+#
+# The job holds a write token, so it checks nothing out and runs no file of the package or of this
+# repository: only `gh`, with the tag through the environment.
+#
+# Called from a package repository's release.yml, once the gates have passed:
+#
+#   publish:
+#     needs: release
+#     permissions:
+#       contents: write
+#     uses: xdeck-org/xdeck/.github/workflows/package-publish.yml@main
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    # A manual run from a branch validates and has nothing to publish.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    # The caller's repo pays for this job. Without a ceiling a hung run costs it 360 minutes.
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the GitHub Release for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "The Release for $TAG already exists."
+            exit 0
+          fi
+          flags=()
+          # A hyphen before any build metadata marks a semver prerelease.
+          case "${TAG%%+*}" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "${flags[@]}"
+          echo "Published the Release for $TAG."

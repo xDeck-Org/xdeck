@@ -16,10 +16,15 @@
 import { ensureNotReserved, isGrantableCapability } from './capability';
 import { ReservedCapabilityError } from './errors';
 import {
+  capabilitiesForMethodCall,
   capabilityForMethodCall,
   lookupXdeckMethod,
+  methodImplementationStatus,
+  IDENTITY_SCOPED_METHODS,
+  UNIMPLEMENTED_METHODS,
   XDECK_METHOD_MAP,
-  type XdeckMethodMapping
+  type XdeckMethodMapping,
+  type XdeckMethodName
 } from './method-mapping';
 
 describe('XDECK_METHOD_MAP', () => {
@@ -82,6 +87,48 @@ describe('XDECK_METHOD_MAP', () => {
   });
 });
 
+describe('§9.166 — composed methods (alsoRequires)', () => {
+  it('collectOnline needs the settle key AND the payment key; confirmPayment needs settle only', () => {
+    expect(capabilitiesForMethodCall('invoice.collectOnline')).toEqual(['invoice:settle', 'payment:initiate']);
+    expect(capabilitiesForMethodCall('invoice.confirmPayment')).toEqual(['invoice:settle']);
+    // The single-capability helper still answers with the primary, so old readers stay correct.
+    expect(capabilityForMethodCall('invoice.collectOnline')).toBe('invoice:settle');
+  });
+
+  it('every alsoRequires entry is a grantable capability (no typo can hide in the second key)', () => {
+    for (const [method, mapping] of Object.entries(XDECK_METHOD_MAP)) {
+      const extra = (mapping as { alsoRequires?: readonly string[] }).alsoRequires ?? [];
+      for (const cap of extra)
+        expect({ method, cap, grantable: isGrantableCapability(cap) }).toEqual({ method, cap, grantable: true });
+    }
+  });
+
+  it('invoice.refund asks for BOTH keys — the ledger one and the payment one (§9.166 cluster 6)', () => {
+    // It was deliberately absent until `payment:refund` existed. It exists now, and the pairing is
+    // the point: a package that may credit an invoice cannot also send the money back unless the
+    // deck granted that separately.
+    expect(lookupXdeckMethod('invoice.refund')).not.toBeNull();
+    expect(capabilitiesForMethodCall('invoice.refund')).toEqual(['invoice:credit', 'payment:refund']);
+  });
+
+  it('invoice.payments is a read: invoice:read alone, like invoice.get (§9.166 part 12b-p)', () => {
+    expect(lookupXdeckMethod('invoice.payments')).toEqual({ kind: 'static', capability: 'invoice:read' });
+    expect(capabilitiesForMethodCall('invoice.payments')).toEqual(['invoice:read']);
+  });
+
+  it('payment.gateways sits on the initiate gate alone — never the refund key (§9.171 L3)', () => {
+    expect(lookupXdeckMethod('payment.gateways')).toEqual({ kind: 'static', capability: 'payment:initiate' });
+    expect(capabilitiesForMethodCall('payment.gateways')).toEqual(['payment:initiate']);
+    expect(methodImplementationStatus('payment.gateways')).toBe('live');
+  });
+
+  it('a non-composed method answers with exactly its one capability, and an unknown with none', () => {
+    expect(capabilitiesForMethodCall('email.send')).toEqual(['email:send']);
+    expect(capabilitiesForMethodCall('nope.nothing')).toEqual([]);
+    expect(capabilitiesForMethodCall('entity.read', 'Order')).toEqual(['entity:read:Order']);
+  });
+});
+
 describe('lookupXdeckMethod', () => {
   it('returns the mapping for a known method', () => {
     expect(lookupXdeckMethod('email.send')).toEqual({ kind: 'static', capability: 'email:send' });
@@ -129,5 +176,54 @@ describe('capabilityForMethodCall', () => {
 
   it('returns null for an unknown method', () => {
     expect(capabilityForMethodCall('frobnicate.foo')).toBeNull();
+  });
+});
+
+describe('§9.94 B2 — SDK surface classification', () => {
+  it('telemetry methods map to their capabilities (the publish-time-detection bug fix)', () => {
+    expect(capabilityForMethodCall('telemetry.track')).toBe('telemetry:track');
+    expect(capabilityForMethodCall('telemetry.identify')).toBe('telemetry:identify');
+    expect(capabilityForMethodCall('telemetry.page')).toBe('telemetry:page');
+  });
+
+  it('UNIMPLEMENTED_METHODS entries are real, mapped, non-reserved methods with a stated reason', () => {
+    for (const [method, reason] of Object.entries(UNIMPLEMENTED_METHODS)) {
+      const mapping = lookupXdeckMethod(method);
+      expect({ method, mapped: mapping !== null }).toEqual({ method, mapped: true });
+      expect(mapping?.kind).not.toBe('reserved'); // reserved is a distinct state
+      expect(typeof reason).toBe('string');
+      expect((reason as string).length).toBeGreaterThan(0);
+    }
+  });
+
+  it('IDENTITY_SCOPED_METHODS are intentionally absent from the capability map (no gate)', () => {
+    for (const method of IDENTITY_SCOPED_METHODS) {
+      expect({ method, mapped: lookupXdeckMethod(method) !== null }).toEqual({ method, mapped: false });
+    }
+  });
+
+  it('methodImplementationStatus classifies each surface state', () => {
+    expect(methodImplementationStatus('email.send')).toBe('live');
+    expect(methodImplementationStatus('telemetry.track')).toBe('live');
+    expect(methodImplementationStatus('push.send')).toBe('unimplemented');
+    expect(methodImplementationStatus('ai.agentInvoke')).toBe('unimplemented');
+    expect(methodImplementationStatus('ai.knowledgeQuery')).toBe('unimplemented');
+    expect(methodImplementationStatus('event.emit')).toBe('reserved');
+    expect(methodImplementationStatus('class.invoke')).toBe('reserved');
+    expect(methodImplementationStatus('config.get')).toBe('identity-scoped');
+    expect(methodImplementationStatus('frobnicate.foo')).toBe('unknown');
+  });
+
+  it('every mapped static/parameterized method is either live or explicitly unimplemented', () => {
+    for (const [method, mapping] of Object.entries(XDECK_METHOD_MAP)) {
+      if ((mapping as XdeckMethodMapping).kind === 'reserved') continue;
+      const status = methodImplementationStatus(method);
+      expect({ method, ok: status === 'live' || status === 'unimplemented' }).toEqual({ method, ok: true });
+    }
+  });
+
+  it('UNIMPLEMENTED_METHODS keys are typed XdeckMethodName (compile-time safety against typos)', () => {
+    const keys = Object.keys(UNIMPLEMENTED_METHODS) as XdeckMethodName[];
+    expect(keys).toEqual(expect.arrayContaining(['push.send', 'ai.agentInvoke', 'ai.knowledgeQuery']));
   });
 });

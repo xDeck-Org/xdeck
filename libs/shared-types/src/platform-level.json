@@ -1,0 +1,17 @@
+{
+  "$comment": "The platform levels, oldest first. A package states the lowest level it runs on in package.json (requires.platform), and a backend refuses a package that needs a level above its own. A published level never changes: what the platform adds goes in a new level at the end, with the day it landed. sharingUserFields lists the sharing-user fields a level added; the sharing-rule lint reads it to work out the level a package needs, and platform-level.gate.spec.ts holds it equal to the fields the backend attaches.",
+  "levels": [
+    {
+      "level": 1,
+      "date": "2026-10-29",
+      "summary": "Every platform from before levels were counted, up to commit 90b2944bf. Its manifest schema has no requires.platform, so it refuses a package that states one.",
+      "sharingUserFields": []
+    },
+    {
+      "level": 2,
+      "date": "2026-10-30",
+      "summary": "Sharing rules can read whether the caller may work in every scope (allScopes) and which of the permissions the deck's rules name the caller holds (holds).",
+      "sharingUserFields": ["allScopes", "holds"]
+    }
+  ]
+}

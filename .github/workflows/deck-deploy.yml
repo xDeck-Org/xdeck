@@ -1,0 +1,153 @@
+name: Reusable Deck Deploy
+
+# §9.171 P8 — the platform's ONE deck deploy for env branches, run by every deck repository. A
+# deck's branch-deploy.yml is a thin caller (on a push to dev1..N, sit or uat):
+#
+#   jobs:
+#     deploy:
+#       permissions:
+#         contents: read
+#         id-token: write
+#       uses: xdeck-org/xdeck/.github/workflows/deck-deploy.yml@main
+#       with:
+#         environment: ${{ github.ref_name }}
+#
+# This workflow checks out the CALLER (the deck) into deck/ and the release host at `xdeck-ref`
+# into xdeck/, validates the deck with the host's validator, then runs the host's deploy.js.
+#
+# No key (row-9171): deploy.js asks GitHub for an OIDC token whose audience names the deck
+# (SLUG.deploy.xdeck.in), and the platform admits it only for that deck — the token's repository id
+# must be the deck's linked repository, its workflow this file on the host at main or a tag, and its
+# GitHub Environment the env the body names. So the caller grants `id-token: write` (a reusable
+# workflow can never hold more than its caller grants) and passes no secret.
+#
+# The job declares `environment:`, so GitHub resolves the CALLER repository's Environment of that
+# name: its DEPLOY_API_URL variable, and the `environment` claim the platform checks. A missing
+# variable fails the deploy before any request.
+#
+# Production is never deployed here: only an env-branch name (dev1..N, sit, uat) is accepted. A
+# production deploy is started from the platform UI on a registered tag (§9.46.5).
+
+on:
+  workflow_call:
+    inputs:
+      xdeck-ref:
+        description: 'xdeck-org/xdeck git ref to take the deck tooling from (default: main).'
+        required: false
+        default: 'main'
+        type: string
+      environment:
+        description: "The env branch's name (dev1..N, sit or uat): the GitHub Environment the deploy runs in, and the env it records."
+        required: true
+        type: string
+      type:
+        description: 'What to deploy: all | config | entities | triggers (deploy.js --type).'
+        required: false
+        default: 'all'
+        type: string
+      triggered-by:
+        description: 'Recorded in the release log (deploy.js --triggered-by).'
+        required: false
+        default: 'merge'
+        type: string
+    secrets:
+      xdeck-checkout-token:
+        description: 'Token with read access to xdeck-org/xdeck. Optional: the host is public, so the run token reads it.'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    # id-token: write — deploy.js mints the deck's own OIDC token; no key reaches this job.
+    permissions:
+      contents: read
+      id-token: write
+    # The caller's repo pays for this job. Without a ceiling a hung run costs it 360 minutes.
+    timeout-minutes: 10
+    steps:
+      - name: Refuse anything but an env branch
+        # The input comes through env: a value pasted into the script would run as script text.
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+        run: |
+          if ! [[ "$ENV_NAME" =~ ^(dev[0-9]+|sit|uat)$ ]]; then
+            echo "❌ deck-deploy deploys env branches only (dev1..N, sit, uat), not '$ENV_NAME'. Production is deployed from the platform UI." >&2
+            exit 1
+          fi
+
+      - name: Checkout the deck
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: deck
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout the release host (deck tooling)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: xdeck-org/xdeck
+          ref: ${{ inputs.xdeck-ref }}
+          path: xdeck
+          token: ${{ secrets.xdeck-checkout-token || github.token }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          # The platform's Node line. This workflow runs in a deck repository, where the platform's
+          # .nvmrc exists only as xdeck/.nvmrc after the checkout above, so the number stays here;
+          # the platform's Node-line gate (scripts/ci/check-node-line.js) holds it to .nvmrc.
+          node-version: '22'
+
+      - name: Install the deck tooling's dependencies
+        # Only what tools/deck-cli/package-lock.json pins, with no install scripts.
+        working-directory: xdeck/tools/deck-cli
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Validate the deck
+        run: node xdeck/tools/deck-cli/validate.js --deck deck
+
+      - name: Deploy to the env
+        # deploy.js mints the deck's OIDC token (no DEPLOY_API_KEY here) and prints the target and the
+        # result, never the token.
+        env:
+          DEPLOY_API_URL: ${{ vars.DEPLOY_API_URL }}
+          ENV_NAME: ${{ inputs.environment }}
+          DEPLOY_TYPE: ${{ inputs.type }}
+          TRIGGERED_BY: ${{ inputs.triggered-by }}
+        run: |
+          node xdeck/tools/deck-cli/deploy.js --deck deck \
+            --type         "$DEPLOY_TYPE" \
+            --env          "$ENV_NAME" \
+            --triggered-by "$TRIGGERED_BY" \
+            --commit-sha   "$GITHUB_SHA"
+
+      - name: Summary
+        if: always()
+        # The inputs come through env: a value pasted into the script would run as script text.
+        env:
+          XDECK_REF: ${{ inputs.xdeck-ref }}
+          ENV_NAME: ${{ inputs.environment }}
+          TRIGGERED_BY: ${{ inputs.triggered-by }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## Env-branch deploy"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Env | \`${ENV_NAME}\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Triggered via | ${TRIGGERED_BY} |"
+            echo "| Deck tooling | \`xdeck-org/xdeck@${XDECK_REF}\` |"
+            echo "| Status | \`${JOB_STATUS}\` |"
+            echo ""
+            echo "Production deploys follow the tag + platform-UI path (§9.46.5) — never this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
