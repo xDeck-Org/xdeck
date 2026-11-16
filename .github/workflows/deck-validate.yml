@@ -1,0 +1,189 @@
+name: Reusable Deck Validate
+
+# §9.171 P8 — the platform's ONE deck validator, run by every deck repository. A deck carries no
+# tooling of its own: its validate-on-pr.yml and validate-on-tag.yml are thin callers,
+#
+#   jobs:
+#     validate:
+#       permissions:
+#         contents: read
+#         id-token: write
+#       uses: xdeck-org/xdeck/.github/workflows/deck-validate.yml@main
+#
+# the way a package repository's release.yml calls package-release.yml. This workflow checks out
+# the CALLER (the deck) into deck/ and the release host at `xdeck-ref` into xdeck/, installs the
+# two packages tools/deck-cli locks (ajv, ajv-formats), and runs the host's validator on the deck.
+# Source of truth: tools/deck-cli/ in the platform monorepo, copied to the host by
+# release-host-sync.yml (scripts/ci/release-host-vendor.js lists it).
+#
+# With `release-tag: true` (the deck's validate-on-tag.yml) it also judges the tag that started the
+# caller — `vX.Y.Z`, or the transitional `SLUG/vX.Y.Z` — and registers it in the platform's release
+# registry (POST /internal/releases, through tools/deck-cli/register-release.js). It never deploys:
+# env branches deploy through deck-deploy.yml, and a production deploy is started from the platform
+# UI (§9.46.5).
+#
+# No key (row-9171): register-release.js asks GitHub for an OIDC token whose audience names the deck
+# (SLUG.deploy.xdeck.in); the platform admits it only for that deck's linked repository, from this
+# workflow on the host at main or a tag, and records the token's repository and commit. The job
+# requests `id-token: write`, so every caller grants it (a reusable workflow can never hold more than
+# its caller grants) — validate-on-pr.yml as well, though only a tag run registers.
+
+on:
+  workflow_call:
+    inputs:
+      xdeck-ref:
+        description: 'xdeck-org/xdeck git ref to take the deck tooling from (default: main).'
+        required: false
+        default: 'main'
+        type: string
+      release-tag:
+        description: |
+          Judge the tag that started the caller (vX.Y.Z or SLUG/vX.Y.Z; env-suffixed and pre-release
+          tags are refused) and, once the deck validates, register it as a release candidate.
+        required: false
+        default: false
+        type: boolean
+      registry-api-url:
+        description: 'Base URL of the platform API that registers a release tag (the caller passes its vars.REGISTRY_API_URL). Required with release-tag.'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      xdeck-checkout-token:
+        description: 'Token with read access to xdeck-org/xdeck. Optional: the host is public, so the run token reads it.'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate deck content
+    runs-on: ubuntu-latest
+    # id-token: write — register-release.js mints the deck's own OIDC token; no key reaches this job.
+    permissions:
+      contents: read
+      id-token: write
+    # The caller's repo pays for this job. Without a ceiling a hung run costs it 360 minutes.
+    timeout-minutes: 10
+    steps:
+      - name: Judge the release tag
+        id: tag
+        if: ${{ inputs.release-tag }}
+        # The tag comes in through env: a value pasted into the script would run as script text.
+        env:
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "❌ release-tag is set, but this run was not started by a tag ($GITHUB_REF)." >&2
+            exit 1
+          fi
+          # Plain semver: the deck's own repository. The slug is read from the deck after checkout.
+          if [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            SLUG=""
+            VERSION="v${BASH_REMATCH[1]}"
+          # Slug-prefixed (transitional).
+          elif [[ "$TAG" =~ ^([a-z0-9][a-z0-9-]{0,49})/v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            SLUG="${BASH_REMATCH[1]}"
+            VERSION="v${BASH_REMATCH[2]}"
+          else
+            echo "❌ Tag does not match vX.Y.Z or <slug>/vX.Y.Z: $TAG" >&2
+            echo "   (Env-suffixed tags like <slug>.<env>/vX.Y.Z and pre-release tags like vX.Y.Z-rc.N are not used for decks — see §9.46.3.)" >&2
+            exit 1
+          fi
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the deck
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          path: deck
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout the release host (deck tooling)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: xdeck-org/xdeck
+          ref: ${{ inputs.xdeck-ref }}
+          path: xdeck
+          token: ${{ secrets.xdeck-checkout-token || github.token }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          # The platform's Node line. This workflow runs in a deck repository, where the platform's
+          # .nvmrc exists only as xdeck/.nvmrc after the checkout above, so the number stays here;
+          # the platform's Node-line gate (scripts/ci/check-node-line.js) holds it to .nvmrc.
+          node-version: '22'
+
+      - name: Install the deck tooling's dependencies
+        # Only what tools/deck-cli/package-lock.json pins, with no install scripts. Nothing the deck
+        # declares is installed: its package.json is its own editors' tooling.
+        working-directory: xdeck/tools/deck-cli
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Validate the deck
+        run: node xdeck/tools/deck-cli/validate.js --deck deck
+
+      - name: Register the release candidate
+        if: ${{ inputs.release-tag }}
+        env:
+          REGISTRY_API_URL: ${{ inputs.registry-api-url }}
+          TAG: ${{ github.ref_name }}
+          TAG_SLUG: ${{ steps.tag.outputs.slug }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$REGISTRY_API_URL" ]; then
+            echo "❌ release-tag needs the registry-api-url input (the deck's vars.REGISTRY_API_URL)." >&2
+            exit 1
+          fi
+          # A plain vX.Y.Z tag names no deck: the deck's own config.json does (its subdomain), as in
+          # tools/deck-cli/deck-dir.js; the repository's name only when config.json names none.
+          SLUG="$TAG_SLUG"
+          if [ -z "$SLUG" ]; then
+            SLUG="$(node -e 'try { const c = require(process.argv[1]); process.stdout.write(typeof c.subdomain === "string" ? c.subdomain : ""); } catch (_) {}' "$PWD/deck/config.json")"
+          fi
+          if [ -z "$SLUG" ]; then SLUG="${GITHUB_REPOSITORY##*/}"; fi
+          if ! [[ "$SLUG" =~ ^[a-z0-9][a-z0-9-]{0,49}$ ]]; then
+            echo "❌ The deck's slug is not lowercase letters, digits and hyphens (1-50): $SLUG" >&2
+            exit 1
+          fi
+          # The deck's own OIDC token (audience SLUG.deploy.xdeck.in) is minted and sent by the verb,
+          # never printed; the platform records the token's repository and commit.
+          node xdeck/tools/deck-cli/register-release.js \
+            --slug         "$SLUG" \
+            --tag          "$TAG" \
+            --version      "$VERSION" \
+            --commit-sha   "$GITHUB_SHA" \
+            --validated-by "$GITHUB_ACTOR"
+
+      - name: Summary
+        if: always()
+        # The inputs come through env: a value pasted into the script would run as script text.
+        env:
+          XDECK_REF: ${{ inputs.xdeck-ref }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## Deck validation"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Ref | \`${GITHUB_REF_NAME}\` |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Deck tooling | \`xdeck-org/xdeck@${XDECK_REF}\` |"
+            echo "| Status | \`${JOB_STATUS}\` |"
+            if [ "$RELEASE_TAG" = "true" ]; then
+              echo "| Release candidate | \`${VERSION:-not a release tag}\` |"
+              echo ""
+              echo "A registered tag is a release candidate only. **Deploy is a separate action in the platform UI** (§9.46.5)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

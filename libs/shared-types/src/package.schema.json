@@ -5,6 +5,128 @@
   "description": "Manifest contract for tenants/_packages/<name>/package.json. Locked under ADR 0002 (2026-04-29). Additive over the pre-2026-04-29 schema; existing 5 packages stay valid without modification.",
   "type": "object",
   "required": ["namespace", "name", "displayName", "version", "description", "maintainer", "marketplace"],
+  "definitions": {
+    "packageSharingCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "op"],
+      "anyOf": [
+        {
+          "required": ["value"]
+        },
+        {
+          "required": ["valueFrom"]
+        }
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "op": {
+          "enum": ["eq", "ne", "in", "nin", "like", "ilike", "gt", "gte", "lt", "lte"]
+        },
+        "value": {},
+        "valueFrom": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      }
+    },
+    "packageSharingGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operator"],
+      "anyOf": [
+        {
+          "required": ["conditions"]
+        },
+        {
+          "required": ["groups"]
+        }
+      ],
+      "properties": {
+        "operator": {
+          "enum": ["AND", "OR"]
+        },
+        "conditions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/packageSharingCondition"
+          }
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/packageSharingGroup"
+          }
+        }
+      }
+    },
+    "packageSharingFilter": {
+      "type": "object",
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "required": ["conditions"]
+        },
+        {
+          "required": ["group"]
+        }
+      ],
+      "properties": {
+        "conditions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/packageSharingCondition"
+          }
+        },
+        "group": {
+          "$ref": "#/definitions/packageSharingGroup"
+        }
+      }
+    },
+    "apiKeyScope": {
+      "type": "string",
+      "enum": [
+        "users:write",
+        "sessions:read",
+        "sessions:write",
+        "tenants:read",
+        "tenants:write",
+        "webhooks:write",
+        "records:read",
+        "records:write",
+        "integrations:read",
+        "integrations:write"
+      ],
+      "description": "An API-key scope, exactly as a deck mints a key with one: a scope missing from this list is one no key can carry."
+    },
+    "offerableApiKeyScope": {
+      "type": "string",
+      "enum": [
+        "tenants:read",
+        "tenants:write",
+        "webhooks:write",
+        "records:read",
+        "records:write",
+        "integrations:read",
+        "integrations:write"
+      ],
+      "description": "An API-key scope a package may offer to a connected deck, or a connection may ask for: every minted scope except the ones that stand on full access to the deck (a connected deck never gets those)."
+    },
+    "webhookEventPattern": {
+      "type": "string",
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9_:*-]+(\\.[A-Za-z0-9_:*-]+)*$",
+      "description": "An event pattern, as a webhook subscription takes one: dot-separated parts, where `*` stands for one part, or for everything when it is the whole pattern."
+    }
+  },
   "properties": {
     "namespace": {
       "type": "string",
@@ -34,6 +156,16 @@
       "default": "feature",
       "description": "Install-behaviour discriminator. Existing packages omit this and default to feature. §9.52 — `entitlement` ships NO classes (no per-tenant code execution); the entire feature is centralised behind §9.50 capabilities + a billing block. Adding `entryClass` / `triggers` to an entitlement manifest is rejected at content-validation time."
     },
+    "role": {
+      "type": "string",
+      "enum": ["base", "overlay"],
+      "default": "base",
+      "description": "§9.148 — for `kind: theme` ONLY. A `base` theme provides a full default surface set (the platform baseline, e.g. standard/theme-aurora). An `overlay` theme extends a base (see `extends`), providing only the surfaces it overrides and inheriting the rest — so a vertical re-skins key surfaces without re-shipping a whole theme. Omitted ⇒ base (every pre-§9.148 theme is a standalone base, unchanged)."
+    },
+    "extends": {
+      "type": "string",
+      "description": "§9.148 — for a theme with `role: overlay` ONLY: the qualified name of the base theme this overlay composes onto (e.g. `standard/theme-aurora`). The base MUST be installed on the tenant, else the install fails with PACKAGE_THEME_BASE_MISSING. Ignored for a base theme."
+    },
     "system": {
       "type": "boolean",
       "default": false,
@@ -42,7 +174,7 @@
     "reversible": {
       "type": "boolean",
       "default": true,
-      "description": "IRREVERTABLE packages (when false): can be installed ONCE on a tenant but can NEVER be uninstalled — `uninstall` hard-fails with PACKAGE_IRREVERSIBLE regardless of role/force. For system-of-record packages whose tables hold data that must persist (identity, audit/compliance, financial ledgers, vertical entity packs once they carry customer data) — uninstalling would be silent data loss. The only way to remove the data is to deprovision the whole tenant. Defaults true (normal install/uninstall). A `false` opt-in should be paired with a loud install-time confirmation. CI tests an irrevertable package via provision→install→deprovision, never install→uninstall."
+      "description": "IRREVERTABLE packages (when false): the flag protects the package's DATA, not its install — `uninstall` hard-fails with PACKAGE_IRREVERSIBLE, regardless of role/force, while any of its tables holds a record its install did not write, in any environment of the deck; while every table holds zero rows (a trial install, a wrong pick), or exactly the rows its install wrote (at most 1,000 a table) with no table outside the package pointing at them, the uninstall proceeds, each table re-checked under an exclusive lock as it is dropped. For system-of-record packages whose tables hold data that must persist (identity, audit/compliance, financial ledgers, vertical entity packs once they carry customer data) — dropping a table with records would be silent data loss. The only way to remove the data is to deprovision the whole tenant. Defaults true (normal install/uninstall). A `false` opt-in should be paired with a loud install-time confirmation. CI tests the data case via provision→install→write→deprovision (the uninstall is refused) and the empty case via install→uninstall."
     },
     "description": {
       "type": "string",
@@ -53,8 +185,14 @@
       "type": "object",
       "required": ["name", "email"],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "email": { "type": "string", "format": "email" }
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "email": {
+          "type": "string",
+          "format": "email"
+        }
       },
       "additionalProperties": false
     },
@@ -69,13 +207,19 @@
         },
         "tags": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 }
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         },
         "pricing": {
           "type": "string",
           "enum": ["free", "paid", "usage-based"]
         },
-        "featured": { "type": "boolean", "default": false },
+        "featured": {
+          "type": "boolean",
+          "default": false
+        },
         "status": {
           "type": "string",
           "enum": ["alpha", "beta", "stable", "deprecated"]
@@ -94,7 +238,10 @@
     },
     "requiredFeatures": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1 },
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
       "uniqueItems": true,
       "default": []
     },
@@ -114,13 +261,19 @@
     },
     "triggers": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1 },
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
       "uniqueItems": true,
       "default": []
     },
     "entities": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1 },
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
       "uniqueItems": true,
       "description": "Legacy flat entity list (still accepted). Prefer provides.entities + requires.entities."
     },
@@ -131,12 +284,18 @@
           "type": "array",
           "items": {
             "oneOf": [
-              { "type": "string", "minLength": 1 },
+              {
+                "type": "string",
+                "minLength": 1
+              },
               {
                 "type": "object",
                 "required": ["name"],
                 "properties": {
-                  "name": { "type": "string", "minLength": 1 },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
                   "extensible": {
                     "type": "boolean",
                     "description": "Slice A2 — when true, the migrator adds a `customFields jsonb DEFAULT '{}'` column so tenants can ship sidecar extensions under tenants/<slug>/entities/extensions/<ns>__<name>.json."
@@ -150,10 +309,24 @@
                     "description": "Slice B5 — opts the entity into Single-Table Inheritance. Tenants declare STI children that share this entity's table, distinguished by the discriminator column.",
                     "required": ["discriminatorColumn", "parentValue"],
                     "properties": {
-                      "discriminatorColumn": { "type": "string", "minLength": 1 },
-                      "parentValue": { "type": "string", "minLength": 1 }
+                      "discriminatorColumn": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "parentValue": {
+                        "type": "string",
+                        "minLength": 1
+                      }
                     },
                     "additionalProperties": false
+                  },
+                  "phi": {
+                    "type": "boolean",
+                    "description": "§9.91.7 — when true, the entity holds Protected Health Information and every READ of it emits a DATA_ACCESSED audit row (§9.91.1 R3). Declared by the package that owns the data; supersedes the (core) PHI_AUDIT_ENTITIES env allowlist, which was global, operator-owed, and silent when unset."
+                  },
+                  "private": {
+                    "type": "boolean",
+                    "description": "When true, the entity's rows belong to the package's own code paths only: the coarse data:* grants never project onto it, the generic entity door refuses it for every caller (a deck owner and a granted device included), and no generic entity screen, navigation entry or readable-entity listing is built for it. For per-person data the generic door cannot scope to its owner. Declared by the package that owns the data. Default false."
                   }
                 },
                 "additionalProperties": false
@@ -171,19 +344,34 @@
           "type": "array",
           "items": {
             "oneOf": [
-              { "type": "string", "minLength": 1 },
+              {
+                "type": "string",
+                "minLength": 1
+              },
               {
                 "type": "object",
                 "required": ["name"],
                 "properties": {
-                  "name": { "type": "string", "minLength": 1 },
-                  "extensible": { "type": "boolean" },
-                  "inheritable": { "type": "boolean" }
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "extensible": {
+                    "type": "boolean"
+                  },
+                  "inheritable": {
+                    "type": "boolean"
+                  }
                 },
                 "additionalProperties": false
               }
             ]
           }
+        },
+        "platform": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The lowest platform level the package runs on (libs/shared-types/src/platform-level.json). A backend below it refuses the install or upgrade. Absent means level 1."
         }
       },
       "additionalProperties": false
@@ -220,7 +408,9 @@
                     "minLength": 1,
                     "description": "Path to the component source, relative to the package root (e.g. `ui/TelemetryProvider.tsx`)."
                   },
-                  "description": { "type": "string" }
+                  "description": {
+                    "type": "string"
+                  }
                 },
                 "additionalProperties": false
               }
@@ -230,6 +420,485 @@
         }
       },
       "additionalProperties": false
+    },
+    "navigation": {
+      "type": "object",
+      "description": "§9.92 A1 — App↔tabs navigation. Present on feature/blueprint packages that surface an App in the launcher; tabs are RBAC-permission-gated per user by the A2 nav-resolution endpoint (requiredPermission, <resource>:<action> wildcard-aware). AJV validates shape; catalogue-level checks (kind eligibility, route shape) run server-side in PackageValidatorService.",
+      "required": ["tabs"],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "icon": {
+          "type": "string",
+          "minLength": 1
+        },
+        "order": {
+          "type": "number"
+        },
+        "audience": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["employee", "consumer"]
+          },
+          "description": "§9.92 A3 — audiences this app is shown to (employee multi-app rail vs consumer flat surface). Absent ⇒ resolves to ['employee'] (safe default: staff-facing until it opts into the consumer surface)."
+        },
+        "tabs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label", "route"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]*$"
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "icon": {
+                "type": "string",
+                "minLength": 1
+              },
+              "route": {
+                "type": "string",
+                "minLength": 1
+              },
+              "surface": {
+                "type": "string",
+                "minLength": 1,
+                "description": "§9.82 — UI surface id the host renders at this tab's route (a package-owned page, e.g. `package:<pkg>.<id>`). Absent ⇒ the host resolves the route itself (standard page / entity CRUD)."
+              },
+              "requiredPermission": {
+                "type": "string",
+                "minLength": 1
+              },
+              "order": {
+                "type": "number"
+              },
+              "kind": {
+                "type": "string",
+                "enum": ["list", "settings", "dashboard"],
+                "description": "§9.92 A3 — tab role for the shell (default-landing pick + settings styling). Absent ⇒ an ordinary content tab."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "dashboardWidgets": {
+          "type": "array",
+          "description": "§9.145 — dashboard widgets this package contributes into the deck's default dashboard. The nav resolver RBAC-filters them per user (requiredPermission, wildcard-aware) and gates them by the app's audience; theme-aurora's Dashboard lays them out in a grid. Each widget's `surface` is a UI surface id the host resolves to a component node.",
+          "items": {
+            "type": "object",
+            "required": ["id", "surface"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]*$"
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1
+              },
+              "surface": {
+                "type": "string",
+                "minLength": 1
+              },
+              "size": {
+                "type": "string",
+                "enum": ["sm", "md", "lg"]
+              },
+              "order": {
+                "type": "number"
+              },
+              "requiredPermission": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "billing": {
+      "type": "object",
+      "description": "§9.92 C1 — per-package monetization. DECLARATIVE only at this slice (no charge path is wired). `model` (free/recurring/one_time) + `plans` + rev-share `payee` seam. Distinct from `marketplace.pricing` (the coarse catalog badge); `billing` is the authoritative monetization descriptor. Coupling rules (plans required unless free, ≤1 default plan, interval required for recurring, no plans/payee when free) are catalogue-level in PackageValidatorService; AJV validates shape only.",
+      "required": ["model"],
+      "properties": {
+        "model": {
+          "type": "string",
+          "enum": ["free", "recurring", "one_time"]
+        },
+        "plans": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label", "amount", "currency"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]*$"
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "amount": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Price in the currency's MAJOR unit (e.g. 2999 = ₹2,999.00), matching the number money convention across LineItem / SubscriptionInfo / PlanPricing."
+              },
+              "currency": {
+                "type": "string",
+                "pattern": "^[A-Z]{3}$"
+              },
+              "interval": {
+                "type": "string",
+                "enum": ["month", "year"]
+              },
+              "description": {
+                "type": "string"
+              },
+              "default": {
+                "type": "boolean"
+              },
+              "limits": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "number"
+                },
+                "description": "§9.92 — optional per-plan numeric limits/entitlements (package-defined keys, e.g. aiMessagesPerMonth; -1 = unlimited). Platform doesn't interpret keys; the package runtime + §9.67 metering enforce them."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "payee": {
+          "type": "object",
+          "description": "Rev-share SEAM (not the payout engine). Records who accrues revenue + the platform share so the C5 attribution ledger can split gross→platformFee→vendorAccrual. Payouts/KYC/tax are DEFERRED. First-party standard/* omit it (100% platform).",
+          "required": ["accountId", "revSharePct"],
+          "properties": {
+            "accountId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "revSharePct": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "edgeDeck": {
+      "type": "object",
+      "description": "§9.84 / ADR-0010 — edge-deck support. Whether (and how) the package runs on the offline-capable on-site appliance (full local op + LAN/WAN serving; cloud stays System of Record). The §9.84 edge-deck runtime reads this to decide what to ship to / activate on the box. Absent ⇒ unsupported / cloud-only (safe default — no package is assumed edge-capable without declaring it).",
+      "required": ["supported"],
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["offline-first", "read-cache", "cloud-only"],
+          "description": "offline-first = full local op, reconciles to cloud SoR on reconnect; read-cache = cached reads offline, writes need cloud; cloud-only = needs connectivity, degrades offline. Meaningful when supported=true (defaults to offline-first)."
+        },
+        "policy": {
+          "type": "object",
+          "description": "§9.171 — the package's edge SYNC policy for its own vertical: the declarative form of the backend's EdgeVerticalPolicy. Core compiles it per deck from the INSTALLED version and refuses the whole block when any field is malformed. `vertical` must equal the package's namespace (checked by scripts/validate-packages.js and by the compiler). `numbering` has no kind that asks the edge engine to mint a series.",
+          "required": ["vertical", "numbering", "eventKey", "conflictDefault", "dataClassDefault", "events"],
+          "properties": {
+            "vertical": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{2,31}$"
+            },
+            "numbering": {
+              "type": "string",
+              "enum": ["free", "deck-ledger"]
+            },
+            "eventKey": {
+              "type": "object",
+              "required": ["scope", "unit", "ordinal"],
+              "properties": {
+                "scope": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                },
+                "unit": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                },
+                "ordinal": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                }
+              },
+              "additionalProperties": false
+            },
+            "conflicts": {
+              "type": "object",
+              "propertyNames": {
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+              },
+              "additionalProperties": {
+                "type": "string",
+                "enum": [
+                  "append-union",
+                  "edge-owned-immutable",
+                  "central-wins-flag-on-stale",
+                  "irreconcilable-review",
+                  "clinical-safety"
+                ]
+              }
+            },
+            "conflictDefault": {
+              "type": "string",
+              "enum": [
+                "append-union",
+                "edge-owned-immutable",
+                "central-wins-flag-on-stale",
+                "irreconcilable-review",
+                "clinical-safety"
+              ]
+            },
+            "dataClasses": {
+              "type": "object",
+              "propertyNames": {
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+              },
+              "additionalProperties": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "required": ["tier"],
+                    "properties": {
+                      "tier": {
+                        "const": "reference"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": ["tier"],
+                    "properties": {
+                      "tier": {
+                        "const": "link-only"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "required": ["tier"],
+                    "properties": {
+                      "tier": {
+                        "const": "sensitive-at-rest"
+                      },
+                      "noStoreAtEdge": {
+                        "type": "boolean"
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "dataClassDefault": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "required": ["tier"],
+                  "properties": {
+                    "tier": {
+                      "const": "reference"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["tier"],
+                  "properties": {
+                    "tier": {
+                      "const": "link-only"
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "required": ["tier"],
+                  "properties": {
+                    "tier": {
+                      "const": "sensitive-at-rest"
+                    },
+                    "noStoreAtEdge": {
+                      "type": "boolean"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "onlineGated": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "maxLength": 64,
+                "pattern": "^[a-z][a-z0-9-]*(?::[a-z][a-z0-9-]*)*$"
+              }
+            },
+            "events": {
+              "type": "object",
+              "minProperties": 1,
+              "propertyNames": {
+                "maxLength": 128,
+                "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9-]*)+$"
+              },
+              "additionalProperties": {
+                "type": "object",
+                "required": ["class", "canonicalIdField"],
+                "properties": {
+                  "class": {
+                    "type": "string",
+                    "pattern": "^[A-Z][A-Za-z0-9]{0,63}$"
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": ["transforms", "jobs"]
+                  },
+                  "method": {
+                    "type": "string",
+                    "pattern": "^[a-z][A-Za-z0-9]{0,63}$"
+                  },
+                  "canonicalIdField": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                  },
+                  "snapshotVersionField": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "optional": {
+      "type": "boolean",
+      "description": "§9.153 — an OPTIONAL capability: operator-installed but INERT (surfaces/nav omitted, actions refused) until the deck owner enables it via the setup wizard (reserved __enabled flag on the governed settings store). Absent/false ⇒ a required, always-on capability."
+    },
+    "rowScope": {
+      "type": "object",
+      "description": "§9.150 — which of this package's entities are partitioned by a record-scope (e.g. per outlet), and by which column. The platform enforces `<column> IN (the reading user's granted scope values)` on non-admin reads via the /tenant/scope-grants primitive; owners/admins bypass; a user with no grant sees nothing (fail-closed). Vertical-neutral: the package supplies the meaning + column, the platform owns enforcement. Absent ⇒ no entity is scope-partitioned.",
+      "required": ["scopeKey", "entities"],
+      "properties": {
+        "scopeKey": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,31}$",
+          "description": "Label for the partition dimension (e.g. 'outlet'). Documentation/telemetry only — enforcement keys on the per-entity column."
+        },
+        "entities": {
+          "type": "object",
+          "description": "Bare entity name → the column carrying the scope value (e.g. { \"Order\": \"outletId\" }). Each listed entity must actually declare that column.",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "routes": {
+      "type": "array",
+      "maxItems": 50,
+      "description": "§9.94 B3.a / ADR-0019 D8 — HTTP routes this package exposes under /api/v1/pkg/<namespace>/<name>/. The kernel mounts ONE catch-all controller + owns every security gate (tenant-resolution, session auth, UserTenantAccess membership, fail-closed rate-limit, route:expose capability); each handler is a SANDBOXED class method. Shape-only here; duplicate ids / signatures / traversal-path checks run server-side via validatePackageRoutes. Absent ⇒ the package exposes no HTTP routes.",
+      "items": {
+        "type": "object",
+        "required": ["id", "method", "path", "handlerClass", "handlerMethod"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{1,63}$",
+            "description": "Stable per-package route id (no ':' or '/'). Becomes the route:expose:<ns>/<name>:<id> capability resource + grant key."
+          },
+          "method": {
+            "type": "string",
+            "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]
+          },
+          "path": {
+            "type": "string",
+            "pattern": "^/",
+            "minLength": 1,
+            "description": "Path under the package prefix, e.g. /orders/:orderId. ':param' segments bind into the request envelope. No wildcards, no '..' (enforced server-side)."
+          },
+          "handlerClass": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Za-z0-9]*$",
+            "description": "Handler class under <scope>/classes/routes/<handlerClass>.ts (sandbox sub-path 'routes')."
+          },
+          "handlerMethod": {
+            "type": "string",
+            "pattern": "^[a-z][a-zA-Z0-9]*$"
+          },
+          "auth": {
+            "type": "string",
+            "enum": ["session", "public-hmac", "public-binding", "consumer"],
+            "description": "Auth mode. 'session' (default) = tenant-subdomain + logged-in member. 'public-hmac' (B3.c) = public server-to-server surface, HMAC-over-rawBody with the route's hmacSecretKey vault secret + replay window. Requires hmacSecretKey (enforced server-side by validatePackageRoutes). 'public-binding' (§9.82.2) = anonymous tenant-subdomain surface for signed-binding callers (printed table QR); handler MUST verify a binding from its body; explicit rateLimit required, requiredPermission forbidden (enforced server-side). 'consumer' (§9.150 B) = identity-gated tenant-subdomain surface for a ClienX consumer ordering from an engaged deck; the kernel verifies a consumer session and the handler receives ONLY the deck-local customerLinkId (never PII); explicit rateLimit required, requiredPermission forbidden (enforced server-side)."
+          },
+          "hmacSecretKey": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]*$",
+            "description": "§9.94 B3.c — required when auth='public-hmac': the §9.50 vault secret key (UPPER_SNAKE) holding the HMAC signing secret. Read server-side; never handed to package code."
+          },
+          "requiredPermission": {
+            "type": "string",
+            "description": "§9.40 RBAC permission the CALLING user must hold — distinct from the package's own route:expose capability."
+          },
+          "rateLimit": {
+            "type": "object",
+            "required": ["limit", "windowSeconds"],
+            "properties": {
+              "limit": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "windowSeconds": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            },
+            "additionalProperties": false
+          },
+          "timeoutMs": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 30000
+          },
+          "description": {
+            "type": "string"
+          },
+          "deprecated": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
     },
     "tokens": {
       "type": "string",
@@ -250,7 +919,21 @@
               "type": "string",
               "enum": ["replace", "merge", "forbid"]
             },
-            "perEntity": { "type": "boolean" }
+            "perEntity": {
+              "type": "boolean"
+            },
+            "device": {
+              "type": "object",
+              "required": ["label"],
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 80
+                }
+              },
+              "additionalProperties": false
+            }
           },
           "additionalProperties": false
         }
@@ -270,42 +953,294 @@
       "description": "§9.80 — typed, owner-editable post-install settings + secrets descriptor. The platform renders a uniform form from `fields` (§9.81 <SchemaForm>), validates submitted values, persists non-secret values per-tenant in tenant_package_setting.values, and routes `secret` fields into the per-tenant encrypted vault. Distinct from `configSchema` (JSON-Schema for the runtime `config` block). PackageValidatorService.checkSettingsSchema runs the deeper per-field shape check via validateConfigSchema; AJV here validates the outer shape.",
       "required": ["fields"],
       "properties": {
-        "version": { "type": "integer", "minimum": 1 },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
         "fields": {
           "type": "array",
           "items": {
             "type": "object",
             "required": ["key", "label", "type"],
             "properties": {
-              "key": { "type": "string", "minLength": 1, "maxLength": 255 },
-              "label": { "type": "string", "minLength": 1 },
+              "key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
               "type": {
                 "type": "string",
-                "enum": ["string", "secret", "number", "boolean", "select", "multiselect", "textarea", "url", "color"]
+                "enum": [
+                  "string",
+                  "secret",
+                  "number",
+                  "boolean",
+                  "select",
+                  "multiselect",
+                  "textarea",
+                  "url",
+                  "color",
+                  "stringlist",
+                  "objectlist"
+                ]
               },
-              "secret": { "type": "boolean" },
-              "required": { "type": "boolean" },
-              "description": { "type": "string" },
-              "placeholder": { "type": "string" },
-              "default": { "type": ["string", "number", "boolean", "null"] },
+              "secret": {
+                "type": "boolean"
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "description": {
+                "type": "string"
+              },
+              "placeholder": {
+                "type": "string"
+              },
+              "default": {
+                "type": ["string", "number", "boolean", "array", "null"],
+                "items": {
+                  "type": "string"
+                }
+              },
               "options": {
                 "type": "array",
                 "items": {
                   "type": "object",
                   "required": ["value", "label"],
                   "properties": {
-                    "value": { "type": "string" },
-                    "label": { "type": "string" }
+                    "value": {
+                      "type": "string"
+                    },
+                    "label": {
+                      "type": "string"
+                    }
                   },
                   "additionalProperties": false
                 }
               },
-              "group": { "type": "string" },
-              "min": { "type": "number" },
-              "max": { "type": "number" },
-              "minLength": { "type": "number" },
-              "maxLength": { "type": "number" },
-              "pattern": { "type": "string" }
+              "group": {
+                "type": "string"
+              },
+              "min": {
+                "type": "number"
+              },
+              "max": {
+                "type": "number"
+              },
+              "minLength": {
+                "type": "number"
+              },
+              "maxLength": {
+                "type": "number"
+              },
+              "pattern": {
+                "type": "string"
+              },
+              "itemFields": {
+                "description": "§9.80 — row shape for an `objectlist` field. Deliberately NARROWER than a top-level field: no `secret` type, no `secret` flag, no nested `objectlist` — the settings store persists row arrays as plaintext JSONB and the vault is keyed by a flat field key, so a nested secret is structurally undeclarable here (validateConfigSchema enforces the same rule semantically).",
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["key", "label", "type"],
+                  "properties": {
+                    "key": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 255
+                    },
+                    "label": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "string",
+                        "number",
+                        "boolean",
+                        "select",
+                        "multiselect",
+                        "textarea",
+                        "url",
+                        "color",
+                        "stringlist"
+                      ]
+                    },
+                    "required": {
+                      "type": "boolean"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "placeholder": {
+                      "type": "string"
+                    },
+                    "default": {
+                      "type": ["string", "number", "boolean", "array", "null"],
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "options": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["value", "label"],
+                        "properties": {
+                          "value": {
+                            "type": "string"
+                          },
+                          "label": {
+                            "type": "string"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
+                    },
+                    "min": {
+                      "type": "number"
+                    },
+                    "max": {
+                      "type": "number"
+                    },
+                    "minLength": {
+                      "type": "number"
+                    },
+                    "maxLength": {
+                      "type": "number"
+                    },
+                    "pattern": {
+                      "type": "string"
+                    },
+                    "visibleWhen": {
+                      "description": "Render this field only while another field in the SAME section matches. An ARRAY means AND. Presentation only — never an authorisation boundary; the server still validates and gates every key.",
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": ["key"],
+                          "properties": {
+                            "key": {
+                              "type": "string",
+                              "description": "Sibling field key in the same section (dotted paths allowed)."
+                            },
+                            "equals": {
+                              "type": ["string", "number", "boolean"],
+                              "description": "Show when the sibling equals this."
+                            },
+                            "oneOf": {
+                              "type": "array",
+                              "items": {
+                                "type": ["string", "number", "boolean"]
+                              },
+                              "description": "Show when the sibling is one of these."
+                            },
+                            "truthy": {
+                              "type": "boolean",
+                              "description": "Show when the sibling is truthy (the toggle case)."
+                            }
+                          }
+                        },
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["key"],
+                            "properties": {
+                              "key": {
+                                "type": "string",
+                                "description": "Sibling field key in the same section (dotted paths allowed)."
+                              },
+                              "equals": {
+                                "type": ["string", "number", "boolean"],
+                                "description": "Show when the sibling equals this."
+                              },
+                              "oneOf": {
+                                "type": "array",
+                                "items": {
+                                  "type": ["string", "number", "boolean"]
+                                },
+                                "description": "Show when the sibling is one of these."
+                              },
+                              "truthy": {
+                                "type": "boolean",
+                                "description": "Show when the sibling is truthy (the toggle case)."
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "visibleWhen": {
+                "description": "Render this field only while another field in the SAME section matches. An ARRAY means AND. Presentation only — never an authorisation boundary; the server still validates and gates every key.",
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["key"],
+                    "properties": {
+                      "key": {
+                        "type": "string",
+                        "description": "Sibling field key in the same section (dotted paths allowed)."
+                      },
+                      "equals": {
+                        "type": ["string", "number", "boolean"],
+                        "description": "Show when the sibling equals this."
+                      },
+                      "oneOf": {
+                        "type": "array",
+                        "items": {
+                          "type": ["string", "number", "boolean"]
+                        },
+                        "description": "Show when the sibling is one of these."
+                      },
+                      "truthy": {
+                        "type": "boolean",
+                        "description": "Show when the sibling is truthy (the toggle case)."
+                      }
+                    }
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["key"],
+                      "properties": {
+                        "key": {
+                          "type": "string",
+                          "description": "Sibling field key in the same section (dotted paths allowed)."
+                        },
+                        "equals": {
+                          "type": ["string", "number", "boolean"],
+                          "description": "Show when the sibling equals this."
+                        },
+                        "oneOf": {
+                          "type": "array",
+                          "items": {
+                            "type": ["string", "number", "boolean"]
+                          },
+                          "description": "Show when the sibling is one of these."
+                        },
+                        "truthy": {
+                          "type": "boolean",
+                          "description": "Show when the sibling is truthy (the toggle case)."
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
             },
             "additionalProperties": false
           }
@@ -315,9 +1250,233 @@
     },
     "permissions": {
       "type": "array",
-      "items": { "type": "string", "minLength": 1 },
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
       "uniqueItems": true,
       "default": []
+    },
+    "roles": {
+      "type": "array",
+      "description": "§9.149 — persona roles this vertical package contributes to the installing tenant's RBAC. Materialised by the core install pipeline (never by sandboxed package code), tenant-scoped and idempotent (re-seed reconciles: adds newly-declared allow-listed perms to an existing role, never removes). Each role's permissions must all be in the package-role allow-list (data:read/write/delete + users:read + class:invoke + consumers:read/consumers:create + deck:read + deck_invoices:read/issue/settle) or be a per-class grant; the seeder rejects anything else (the retired settings:read still validates and is dropped by the seeder). Owner/Admin stay platform-seeded.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "displayName", "priority", "permissions"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "displayName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "priority": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "permissions": {
+            "type": "array",
+            "description": "Either a fixed platform permission, or a PER-CLASS action grant `<ClassName>:<method>` (e.g. `CreateOrder:run`). Since the P0 fail-closed fix the dispatcher gates `class:<C>.<M>` on the specific `<C>:<M>` grant, so a persona must enumerate the classes it may run; `class:invoke` is only a coarse prerequisite. The per-class shape is deliberately narrow (UpperCamel class, lowerCamel method) so it can never express a platform capability — those are all lowercase-prefixed, an invariant `consumers:read` / `consumers:create` restored when they were renamed out of the `Consumer:*` spelling this pattern happened to match. Keep in lockstep with PACKAGE_ROLE_ALLOWED_PERMISSIONS + PACKAGE_ROLE_CLASS_PERMISSION_PATTERN in package.types.ts.",
+            "items": {
+              "type": "string",
+              "anyOf": [
+                {
+                  "enum": [
+                    "data:read",
+                    "data:write",
+                    "data:delete",
+                    "settings:read",
+                    "users:read",
+                    "class:invoke",
+                    "consumers:read",
+                    "consumers:create",
+                    "deck:read",
+                    "deck_invoices:read",
+                    "deck_invoices:issue",
+                    "deck_invoices:settle"
+                  ]
+                },
+                {
+                  "pattern": "^[A-Z][A-Za-z0-9]*(?:\\.[A-Za-z0-9]+)*:[a-z][A-Za-z0-9]*$"
+                }
+              ]
+            },
+            "uniqueItems": true,
+            "minItems": 1
+          },
+          "servingTypes": {
+            "type": "array",
+            "description": "OPTIONAL narrowing — the ways of serving this persona belongs to, as the package's OWN serving-type machine codes (lowercase snake_case, ≤40 chars). A role that declares them applies only to a deck actively serving one of the named ways; a role that omits them is universal. Core intersects the codes with the deck's active set (packageRoleAppliesToServingTypes) but never interprets them — the vocabulary stays the vertical's own, so no serving language enters the platform.",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_]{0,39}$"
+            },
+            "uniqueItems": true,
+            "minItems": 1
+          },
+          "color": {
+            "type": "string"
+          },
+          "managedAt": {
+            "type": "string",
+            "enum": ["deck", "scope"],
+            "description": "WHERE this persona is administered. 'deck' = authority not confined to one site (a vertical's manager, grouped with the owner/admin in the team editor). 'scope' (the DEFAULT when omitted) = managed at the package's own scope unit, whatever rowScope.scopeKey names it (facility, outlet, ...). Defaulting to 'scope' is deliberate: an unlabelled persona lands with the staff, never accidentally in the deck tier. Owner/Admin are platform-seeded and always deck-level regardless."
+          }
+        }
+      },
+      "default": []
+    },
+    "templates": {
+      "type": "array",
+      "description": "§9.153 — message templates this package contributes to the installing deck. Materialised by the core install pipeline through the deck's configured template store (never by sandboxed package code), and AUTHOR-TIME SEEDED: a template the deck does not have is created, one it already has is never overwritten (a template body is prose the deck edits; there is no additive merge for prose). Templates are left in place on uninstall, matching what the platform already does with package roles.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "name", "body"],
+        "properties": {
+          "type": {
+            "enum": ["email", "sms", "whatsapp"],
+            "description": "Channel — mirrors the platform's TemplateType."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*$",
+            "description": "Template name without the .hbs suffix, addressed as <type>/<name>. Path-safe kebab-case; `/` nests. Narrower than the platform's traversal check on purpose — a manifest is read by path-shaped stores too, so the declaration surface refuses anything a store would have to make safe."
+          },
+          "subject": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300,
+            "description": "Subject line — EMAIL only. Stored as the leading {{!-- Subject: ... --}} comment inside the body, so this is authoring convenience, not a second storage location. Declared on a non-email template it is REFUSED (it would otherwise be silently discarded at render)."
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The Handlebars source."
+          },
+          "locale": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 35,
+            "pattern": "^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$",
+            "description": "BCP-47-style language tag; defaults to 'en' when omitted. Template identity stays (type, name) — locale is DATA riding on the member, not part of the key — so two locales of one name collide until the template store learns locale-aware identity. In the per-member file layout (ADR-0031 D10) the locale is the directory: sms/en/order-ready.json."
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 240,
+            "description": "Author-facing note for the marketplace/preview surfaces. Never rendered to a recipient."
+          },
+          "servingTypes": {
+            "type": "array",
+            "description": "OPTIONAL narrowing — the ways of serving this artifact belongs to, as the package's OWN serving-type machine codes (lowercase snake_case, ≤ 40 chars). Same rule as roles[].servingTypes and evaluated by the same primitive (artifactAppliesToServingTypes): declared + intersecting applies, declared + disjoint does not, undeclared is universal, and an unresolvable active set never narrows.",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_]{0,39}$"
+            },
+            "uniqueItems": true,
+            "minItems": 1
+          }
+        }
+      },
+      "default": []
+    },
+    "sharingRules": {
+      "type": "array",
+      "description": "§9.153 — record-visibility rules this package contributes to the installing deck. This is deck AUTHORIZATION data (a sharing rule decides who can see whose records), so core is the only writer and the seed is strictly AUTHOR-TIME: a rule the deck already holds — including one it has since deleted — is left exactly as it stands. §9.133 PR-4 closed the file-import door onto this table for the same reason; a package door that could overwrite a live visibility policy would be the same hole in a different shape.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "resource", "actions"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Stable rule name, unique per resource on the deck."
+          },
+          "resource": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Entity the rule governs. Must be an entity this package provides or requires — core does not check that (it never learns the vertical's vocabulary), so the package's own specs are what pin it."
+          },
+          "actions": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 40
+            },
+            "description": "Actions the rule opens, e.g. [\"read\"]."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "priority": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 100
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 240
+          },
+          "userFilter": {
+            "$ref": "#/definitions/packageSharingFilter"
+          },
+          "recordFilter": {
+            "$ref": "#/definitions/packageSharingFilter"
+          },
+          "servingTypes": {
+            "type": "array",
+            "description": "OPTIONAL narrowing — the ways of serving this artifact belongs to, as the package's OWN serving-type machine codes (lowercase snake_case, ≤ 40 chars). Same rule as roles[].servingTypes and evaluated by the same primitive (artifactAppliesToServingTypes): declared + intersecting applies, declared + disjoint does not, undeclared is universal, and an unresolvable active set never narrows.",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_]{0,39}$"
+            },
+            "uniqueItems": true,
+            "minItems": 1
+          }
+        }
+      },
+      "default": []
+    },
+    "servingTypesSource": {
+      "type": "object",
+      "description": "Where this package's deck-ACTIVE serving-type codes live — the data half of the roles[].servingTypes narrowing. The codes are rows in one of the package's OWN entity-DSL tables; core resolves them generically (query `entity`, read `codeColumn`, a row is active when `activeColumn` is truthy; no activeColumn ⇒ all rows). `entity` is namespace-relative like other manifest entity refs (bare name = this package's own entity, `ns/Entity` reaches across). Absent ⇒ no active set is resolvable and every declared role keeps seeding.",
+      "required": ["entity", "codeColumn"],
+      "properties": {
+        "entity": {
+          "type": "string",
+          "pattern": "^(?:[a-z][a-z0-9-]{2,31}/)?[A-Za-z_][A-Za-z0-9_]*$",
+          "description": "Entity holding the serving-type rows. Bare name (e.g. `OrderType`) = this package's own entity; a `ns/Entity` form reaches across packages, mirroring entity-JSON lookup targets."
+        },
+        "codeColumn": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "description": "Column carrying the serving-type machine code (e.g. `code`)."
+        },
+        "activeColumn": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "description": "Optional boolean column gating which rows are ACTIVE (e.g. `isActive`). Absent ⇒ every row counts."
+        }
+      },
+      "additionalProperties": false
     },
     "capabilities": {
       "type": "object",
@@ -325,22 +1484,130 @@
       "properties": {
         "required": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
           "uniqueItems": true,
           "default": []
         },
         "optional": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
           "uniqueItems": true,
           "default": []
         },
         "provides": {
           "type": "array",
-          "items": { "type": "string", "minLength": 1 },
+          "items": {
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "required": ["id"],
+                "additionalProperties": false,
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "mutates": {
+                    "type": "boolean"
+                  },
+                  "aiExecution": {
+                    "type": "string",
+                    "enum": ["forbidden", "draft", "auto"]
+                  },
+                  "touchesSettings": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            ]
+          },
           "uniqueItems": true,
           "default": [],
-          "description": "Runtime-API capabilities this package EMITS — exposes via the §9.50 `xdeck.*` global to other installed packages running in the same tenant. The host's capability bridge enforces grants per consumer; declaring a capability here is the supply side. Used by `standard/telemetry` so any installed package can call `xdeck.telemetry.track(...)` without bundling the SDK directly."
+          "description": "Capabilities this package SUPPLIES to other installed packages in the same tenant. Two grammar forms (discriminated by the `@<semver>` suffix): (1) the legacy kernel-capability MOUNT `<kernel-ns>:<verb>` (e.g. `telemetry:track`) — a `system` package backing a kernel verb exposed via the §9.50 `xdeck.*` global; (2) §9.94 B5.a / ADR-0019 D9 PACKAGE capability `<namespace>:<name>@<semver>` (e.g. `restroin:menu-lookup@1.0.0`) — this package's OWN versioned, namespaced verb that other packages consume through the kernel broker. Each entry is EITHER a bare id string OR the §9.52.15 A2 rich descriptor object `{ id, description?, mutates?, aiExecution?(forbidden|draft|auto), touchesSettings? }` carrying the author's AI-facing metadata (a bare string resolves to the SAFE defaults — `aiExecution: forbidden`). Content validation (kernel-wins for the D9 form: a package can never shadow a kernel namespace; descriptor normalization) runs in PackageValidatorService.validate() via @xdeck/runtime-api `validateManifestCapabilities` / `normalizeProvidedCapability`; AJV here validates shape only."
+        },
+        "consumes": {
+          "type": "object",
+          "description": "§9.94 B5.b / ADR-0019 D9.2 — package→package capabilities this package CONSUMES from OTHER installed packages, as `<namespace>:<name>@<range>` (e.g. `restroin:menu-lookup@^1.0.0`). `required` = HARD (install fails with CAPABILITY_NOT_PROVIDED if no installed package provides a satisfying version); `optional` = SOFT (degrades). Distinct from top-level `required`/`optional` (kernel grants). Content validation (grammar + kernel-wins) runs server-side via `validateManifestCapabilities`; AJV here validates shape only.",
+          "properties": {
+            "required": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true,
+              "default": []
+            },
+            "optional": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true,
+              "default": []
+            }
+          },
+          "additionalProperties": false
+        },
+        "providesHandlers": {
+          "type": "object",
+          "description": "§9.94 B5.c / ADR-0019 D9.1 — binds each PROVIDED capability (`<namespace>:<name>`) to the sandboxed handler the kernel broker invokes (class under `classes/capabilities/`, method). The broker runs the handler under the CONSUMER-user's authz.",
+          "patternProperties": {
+            "^[a-z][a-z0-9-]*:[a-z][a-z0-9-]*$": {
+              "type": "object",
+              "properties": {
+                "class": {
+                  "type": "string",
+                  "pattern": "^[A-Z][A-Za-z0-9]*$"
+                },
+                "method": {
+                  "type": "string",
+                  "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
+                }
+              },
+              "required": ["class", "method"],
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "skills": {
+          "type": "array",
+          "description": "§9.52.18 — AI Skills this package declares: plain-English guidance the AI assistant follows for a capability the package provides. Each entry is `{ scope: '<namespace>:<name>', instructions }` (+ optional `id`). GUIDANCE, never authority — a skill can never widen a grant, an aiExecution ceiling, or data scope. The sandbox (scope must be a capability the package provides; 'deck' scope is platform/tenant-only) is enforced server-side via `validateManifestCapabilities` → `validateAiSkillEntry`; AJV here validates shape only.",
+          "items": {
+            "type": "object",
+            "required": ["scope", "instructions"],
+            "properties": {
+              "scope": {
+                "type": "string",
+                "minLength": 1
+              },
+              "instructions": {
+                "type": "string",
+                "minLength": 1
+              },
+              "id": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": false
+          },
+          "default": []
         }
       },
       "additionalProperties": false
@@ -348,8 +1615,44 @@
     "installHooks": {
       "type": "object",
       "properties": {
-        "onInstall": { "type": "string", "minLength": 1 },
-        "onUninstall": { "type": "string", "minLength": 1 }
+        "onInstall": {
+          "type": "string",
+          "minLength": 1
+        },
+        "onUninstall": {
+          "type": "string",
+          "minLength": 1
+        },
+        "onOptionalDependencyChanged": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "dataHooks": {
+      "type": "object",
+      "description": "§9.24 — SUBJECT data-lifecycle hooks (deliberately separate from installHooks, which is the PACKAGE's lifecycle on a deck). Each is a `classes/<kind>/<Class>.<method>` ref (core) invokes so the package owns its own data: `onUserErasure` tears down one subject's data (PackageDataLifecycleService); `onUserIdentify` (§9.163 PR-2) resolves an anonymous visitor onto a known user, which is why (core) no longer needs to know this package's table names.",
+      "properties": {
+        "onUserErasure": {
+          "type": "string",
+          "minLength": 1
+        },
+        "onUserIdentify": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "connectorHooks": {
+      "type": "object",
+      "description": "§9.91.9 PR-6 — CONNECTOR bindings this package contributes to a (core) connector: (core) owns the connector (network, consent gate, queue); the package owns the domain knowledge the connector must never invent. Closed vocabulary — each hook is added here deliberately. `abdmFhirShaper` is a `classes/<kind>/<Class>.<method>` ref the (core) ABDM_FHIR_SHAPER bridge invokes to shape an M2 HIP-share FHIR bundle; exactly ONE installed package per deck may declare it.",
+      "properties": {
+        "abdmFhirShaper": {
+          "type": "string",
+          "minLength": 1
+        }
       },
       "additionalProperties": false
     },
@@ -360,11 +1663,26 @@
         "type": "object",
         "required": ["target_file", "anchor_id", "operation", "content_path"],
         "properties": {
-          "target_file": { "type": "string", "minLength": 1 },
-          "section": { "type": "string", "minLength": 1 },
-          "anchor_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
-          "operation": { "type": "string", "enum": ["insert_or_update", "append"] },
-          "content_path": { "type": "string", "minLength": 1 }
+          "target_file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "section": {
+            "type": "string",
+            "minLength": 1
+          },
+          "anchor_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "operation": {
+            "type": "string",
+            "enum": ["insert_or_update", "append"]
+          },
+          "content_path": {
+            "type": "string",
+            "minLength": 1
+          }
         },
         "additionalProperties": false
       }
@@ -375,7 +1693,7 @@
       "properties": {
         "events": {
           "type": "object",
-          "description": "Map of event name → declaration. Event names are namespaced by the package itself — declaring `appointment_booked` here from `acme/booking-flow` produces the qualified id `acme/booking-flow#appointment_booked` in the catalogue, preventing cross-package name collisions.",
+          "description": "Keys must match the event-name pattern `^[a-z][a-zA-Z0-9_]*$`.",
           "patternProperties": {
             "^[a-z][a-zA-Z0-9_]*$": {
               "type": "object",
@@ -406,18 +1724,615 @@
               "additionalProperties": false
             }
           },
-          "additionalProperties": false,
-          "description": "Keys must match the event-name pattern `^[a-z][a-zA-Z0-9_]*$`."
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
+    },
+    "uiProfiles": {
+      "type": "object",
+      "description": "§9.101 — UI-Type material profiles this theme supports. `supported` is a non-empty array of well-known UI-Type ids; `default` ∈ supported is the fallback profile; `presets` are optional named cross-axis shorthands. AJV here validates SHAPE only — registry-membership + single-select-per-axis semantics run server-side in PackageValidatorService via @xdeck/shared-types `validateThemeUiProfiles`. Only meaningful on `kind: theme` manifests.",
+      "required": ["supported", "default"],
+      "properties": {
+        "supported": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "default": {
+          "type": "string",
+          "minLength": 1
+        },
+        "presets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label", "profiles"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*$"
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              },
+              "profiles": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "minItems": 1,
+                "uniqueItems": true
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "aiHooks": {
+      "type": "object",
+      "description": "§9.158 PR-4 — AI-side declarations. `dailyDigest.metrics` names this package's numbers for the daily business digest: reader-facing name → {entity (BARE), agg (count|sum), column (required unless agg=count), description?}. Declarative on purpose — naming a number needs no code, so unlike connectorHooks this binds no class. Labels are applied at READ time; a name declared by two installed packages is dropped by both (fail-closed).",
+      "properties": {
+        "dailyDigest": {
+          "type": "object",
+          "properties": {
+            "metrics": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "entity": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "agg": {
+                    "type": "string",
+                    "enum": ["count", "sum"]
+                  },
+                  "column": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": {
+                    "type": "string"
+                  }
+                },
+                "required": ["entity", "agg"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "peerDependencies": {
+      "type": "object",
+      "description": "§9.68 — must ALREADY be installed at a satisfying version; never auto-installed. Install refuses if a peer is absent.",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9-]{2,31}/[a-z][a-z0-9-]*$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "description": "semver constraint — '^1.0.0', '~1.2.0', '>=1.0.0 <2.0.0', '*'"
+      }
+    },
+    "optionalDependencies": {
+      "type": "object",
+      "description": "§9.68 — enriches behaviour when present, no-op when absent. Surfaced in the install preview; never auto-installed.",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9-]{2,31}/[a-z][a-z0-9-]*$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "description": "semver constraint — '^1.0.0', '~1.2.0', '>=1.0.0 <2.0.0', '*'"
+      }
+    },
+    "conflicts": {
+      "type": "array",
+      "description": "§9.68 — qualified package ids that cannot coexist with this package. Install refuses if any is present.",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{2,31}/[a-z][a-z0-9-]*$"
+      }
+    },
+    "scheduledJobs": {
+      "type": "array",
+      "description": "ADR-0031 rung 9 — schedules this package declares. The cron runtime (master-DB registry, refresh, BullMQ fan-out) already ships; this is the declarative door onto it, so a package whose purpose is a periodic sweep no longer needs a caller to bootstrap it imperatively. Registered at install and REMOVED at uninstall: a cron row that outlives its package fires at code that is no longer there.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "cron", "classId"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Stable job name, unique per package on the deck — the member identity."
+          },
+          "cron": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Standard 5- or 6-field cron expression. Rejected at seed time if node-cron cannot parse it."
+          },
+          "classId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "The class to invoke, in this package's own classes/ tree."
+          },
+          "method": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Method on the class. Defaults to 'run'."
+          },
+          "input": {
+            "type": ["object", "null"],
+            "description": "A fixed argument object. Constant by design — a schedule takes no caller input."
+          },
+          "timeoutMs": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "Per-run ceiling in milliseconds. Absent ⇒ the platform default."
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Human-facing, deck voice — what this does, for whoever reads the deck’s schedule list."
+          }
+        }
+      }
+    },
+    "lookups": {
+      "type": "array",
+      "description": "ADR-0031 rung 5 (D6) — reference lists this package declares (statuses, types, units…). Written by the core seeder at install, insert-if-missing per environment, BEFORE installHooks.onInstall — the declarative replacement for a SeedLookups job. Each entry names one of THIS package's own entities and the rows it must contain; the only universal column is `code`, and every other key must be a column the entity declares (a mismatch refuses the list, never drops a field).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["entity", "rows"],
+        "properties": {
+          "entity": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[A-Za-z][A-Za-z0-9]*$",
+            "description": "Bare entity name declared by this package under provides.entities."
+          },
+          "rows": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["code"],
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+                  "description": "Stable identifier, unique per deck within the entity — the member identity."
+                }
+              },
+              "additionalProperties": {
+                "type": ["string", "number", "boolean", "null"]
+              },
+              "description": "One row. Flat scalars only; keys other than code must be columns of the entity."
+            }
+          },
+          "servingTypes": {
+            "type": "array",
+            "description": "OPTIONAL narrowing — the ways of serving this artifact belongs to, as the package's OWN serving-type machine codes (lowercase snake_case, ≤ 40 chars). Same rule as roles[].servingTypes and evaluated by the same primitive (artifactAppliesToServingTypes): declared + intersecting applies, declared + disjoint does not, undeclared is universal, and an unresolvable active set never narrows.",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_]{0,39}$"
+            },
+            "uniqueItems": true,
+            "minItems": 1
+          }
+        }
+      }
+    },
+    "integratorTemplates": {
+      "type": "array",
+      "maxItems": 20,
+      "description": "Integrator templates this package contributes: presets of an integrator's kind and of the receivers, connectors and credential slots it suggests. Read from the installed manifest whenever a deck lists its templates, as `<namespace>/<name>:<id>`; nothing is seeded into the deck, so an uninstall removes them. A template prefills the console's forms and never writes on its own. Held to the API's own rules at install (an invalid one refuses the install) and again when listed (an invalid one is skipped, logged and counted).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "description", "systemKind", "credentials", "receivers", "connectors"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,47}$",
+            "description": "Unique inside this package."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "Plain sentences, for whoever picks a template."
+          },
+          "systemKind": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "description": "The integrator's kind of system: a label that changes no behaviour."
+          },
+          "credentials": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["key", "kind", "label", "hint"],
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{0,31}$",
+                  "description": "Unique in its own list."
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "api_key",
+                    "basic",
+                    "bearer",
+                    "oauth2_client_credentials",
+                    "oauth2_authorization_code",
+                    "hmac_secret"
+                  ],
+                  "description": "A kind of credential a person adds. Never a secret."
+                },
+                "label": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 80
+                },
+                "hint": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 300,
+                  "description": "A plain sentence: what the person fills in, or where to find it."
+                }
+              }
+            }
+          },
+          "receivers": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["key", "name", "hint", "fields"],
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{0,31}$",
+                  "description": "Unique in its own list."
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 120
+                },
+                "hint": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 300,
+                  "description": "A plain sentence: what the person fills in, or where to find it."
+                },
+                "credential": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{0,31}$",
+                  "description": "The key of one of this template's credentials."
+                },
+                "fields": {
+                  "type": "object",
+                  "description": "The facet's create body as the deck's own route takes it, less the credential id (and the name, and a connector's address, which are given beside it). Open here: it is held to that route's validation and rules at install and again whenever a deck lists it."
+                }
+              }
+            }
+          },
+          "connectors": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["key", "name", "hint", "fields"],
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{0,31}$",
+                  "description": "Unique in its own list."
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 120
+                },
+                "hint": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 300,
+                  "description": "A plain sentence: what the person fills in, or where to find it."
+                },
+                "credential": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{0,31}$",
+                  "description": "The key of one of this template's credentials."
+                },
+                "baseUrl": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2048,
+                  "description": "Left out where the address is the person's own account; the hint says what to fill in."
+                },
+                "fields": {
+                  "type": "object",
+                  "description": "The facet's create body as the deck's own route takes it, less the credential id (and the name, and a connector's address, which are given beside it). Open here: it is held to that route's validation and rules at install and again whenever a deck lists it."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "connectedApps": {
+      "type": "array",
+      "maxItems": 10,
+      "description": "Connected apps this package offers: what a deck running one of the allowed packages may be given on a deck that runs this one, once that deck's owners turn the offer on. An offer seeds nothing. It never offers a whole deck: a connected deck's key acts as a role this package ships and reaches only what one of its sharing rules, with a record filter, confines it to. An offer naming a role or a sharing rule this package does not ship, or a rule with no record filter, is refused.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "allowedPackages", "scopes", "role", "recordScope"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,47}$",
+            "description": "Unique inside this package. A connection names the app as `<namespace>/<name>:<id>`."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "Plain sentences, for the owners deciding whether to turn the offer on."
+          },
+          "allowedPackages": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50,
+            "uniqueItems": true,
+            "description": "The packages whose decks may connect, as `<namespace>/<name>`. This package may name itself: two decks running it may connect.",
+            "items": {
+              "type": "string",
+              "maxLength": 97,
+              "pattern": "^[a-z][a-z0-9-]{2,31}/[a-z][a-z0-9-]*$"
+            }
+          },
+          "scopes": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "description": "The API-key scopes offered. A connected deck's key holds at most these; a scope that stands on full access to the deck cannot be offered.",
+            "items": {
+              "$ref": "#/definitions/offerableApiKeyScope"
+            }
+          },
+          "events": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50,
+            "uniqueItems": true,
+            "description": "The events a connected deck may be sent, as a webhook subscription's patterns.",
+            "items": {
+              "$ref": "#/definitions/webhookEventPattern"
+            }
+          },
+          "role": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "The name of one of this package's roles: the role a connected deck's key acts as on this deck."
+          },
+          "recordScope": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "The name of one of this package's sharing rules, which must carry a record filter: it confines one connected deck to its own share."
+          }
+        }
+      }
+    },
+    "connections": {
+      "type": "array",
+      "maxItems": 10,
+      "description": "Connections this package brings: each becomes an integrator on the installing deck, switched off and holding no credential, with its receivers, connectors, schedules and handlers in place, until a person on the deck turns it on. A connection names the connected app it connects to as `<namespace>/<name>:<id>`, never a deck or an address, so the deck that offers it need not run this package. Its template is an integrator template, held to the same rules; each schedule and handler names what it runs on by its key in the same connection. Removed by an uninstall.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "connectedApp", "scopes", "template"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,47}$",
+            "description": "Unique inside this package."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "Plain sentences, for whoever turns the connection on."
+          },
+          "connectedApp": {
+            "type": "string",
+            "maxLength": 146,
+            "pattern": "^[a-z][a-z0-9-]{2,31}/[a-z][a-z0-9-]*:[a-z][a-z0-9-]{0,47}$",
+            "description": "The connected app, as `<namespace>/<name>:<id>`. Never a deck id or an address."
+          },
+          "scopes": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "description": "The API-key scopes asked for, never one that stands on full access to a deck. The key a deck is given holds those the app also offers.",
+            "items": {
+              "$ref": "#/definitions/offerableApiKeyScope"
+            }
+          },
+          "template": {
+            "$ref": "#/properties/integratorTemplates/items"
+          },
+          "schedules": {
+            "type": "array",
+            "maxItems": 8,
+            "description": "Schedules built with the connection, as a person creates them by hand, less their ids. They arrive switched off.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["key", "name", "targetKind", "target", "cron"],
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{0,31}$",
+                  "description": "Unique in its own list."
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 120
+                },
+                "targetKind": {
+                  "type": "string",
+                  "enum": ["connector_pull", "connector_push", "receiver_batch", "handler"],
+                  "description": "What it runs: a pull or a push on a connector, a receiver's batch, or a scheduled handler."
+                },
+                "target": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{0,31}$",
+                  "description": "The key of what it runs, in this connection: a connector of its template for a pull or a push, a receiver of its template for a batch, or one of its scheduled handlers."
+                },
+                "cron": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 120,
+                  "description": "Five fields: minute, hour, day of month, month and day of week. The deck's plan sets how close two runs may come."
+                },
+                "timezone": {
+                  "type": "string",
+                  "maxLength": 64,
+                  "description": "The time zone the fields are read in, by name."
+                },
+                "payload": {
+                  "type": "object",
+                  "description": "What each run is given, as a schedule made by hand takes it."
+                }
+              }
+            }
+          },
+          "handlers": {
+            "type": "array",
+            "maxItems": 8,
+            "description": "Handlers built with the connection, as a person creates them by hand, less their ids. The class is always this package's own. They arrive switched off.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["key", "name", "trigger", "className", "capabilities"],
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{0,31}$",
+                  "description": "Unique in its own list. A handler schedule names a scheduled handler by it."
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 120
+                },
+                "trigger": {
+                  "type": "string",
+                  "enum": ["inbound", "inbound_sync", "deck_event", "pull_page", "scheduled"],
+                  "description": "When the class runs: a receiver stored an event, a receiver awaits its answer, a deck event fired, a connector fetched a page, or a schedule reached its time."
+                },
+                "source": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9-]{0,31}$",
+                  "description": "The key of the receiver (inbound, inbound_sync) or connector (pull_page) of this connection's template it is bound to. A deck-event or scheduled handler names none."
+                },
+                "eventName": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 160,
+                  "description": "For a deck event: the event it listens for."
+                },
+                "className": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 160,
+                  "description": "The class, by its file's name in this package's integrations folder."
+                },
+                "method": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64,
+                  "description": "The method to call. Left out, each trigger has its own."
+                },
+                "capabilities": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "description": "What the class may do, by capability name. Empty means it can only compute.",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "timeoutMs": {
+                  "type": "integer",
+                  "minimum": 1000,
+                  "description": "The run's budget in milliseconds. Left out, the platform's default."
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "additionalProperties": false,
   "allOf": [
     {
       "if": {
-        "properties": { "kind": { "const": "theme" } },
+        "properties": {
+          "kind": {
+            "const": "theme"
+          }
+        },
         "required": ["kind"]
       },
       "then": {

@@ -52,10 +52,58 @@
       "type": "object",
       "description": "Slice B4 — per-field relation DSL. Only meaningful at runtime; the migrator splices these into EntitySchema.options.relations.",
       "additionalProperties": { "$ref": "#/definitions/relation" }
+    },
+    "displayField": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Which column carries this entity's human-readable label — its name in the sense a person means it: an order's orderNo, a menu item's name, an outlet's title. Declared ONCE here, on the entity itself, so every place that references this record renders the same label: a report cell, a dashboard tile, a reference on someone else's detail page. Declaring it per-reference instead would let five packages pointing at the same object each pick a different label and drift. Must name a column this entity declares. Absent ⇒ consumers fall back to a conventional name column, then to a short id — they never render a bare uuid as a label."
+    },
+    "lookups": {
+      "type": "object",
+      "description": "Declared relationships to other entities. Maps an EXISTING foreign-key column on this entity to the entity it points at. Adds no COLUMN — the column must already exist — but it is no longer metadata-only: EntityMigratorService.applyLookupForeignKeys emits a real ON DELETE RESTRICT foreign key for every resolvable entry, on install, on upgrade and on env materialisation, so declaring one on an existing table IS a migration. A reference it cannot resolve is skipped with a warning and falls back to the dispatcher in-use guard. It exists because a foreign key written as `\"comment\": \"FK restroin__outlets.id\"` is prose, and prose is not a contract — nothing can read it, and rewording it silently breaks whatever guessed. Consumed by the report builder (which entities may a report join?) and by any surface that renders a record reference as a name instead of a uuid.",
+      "additionalProperties": { "$ref": "#/definitions/lookup" }
+    },
+    "sealed": {
+      "type": "object",
+      "description": "Marks this entity as a DOCUMENT that freezes once it is issued. While the row's `onceSet` column is null the row is an ordinary draft; once it holds a value, the columns named in `freeze` can no longer be changed and the row can no longer be deleted — refused at the data layer, for every caller, including a deck owner holding `*:*`. Declaring it is free: it adds no column and no constraint, and an entity that declares nothing pays nothing. It exists because an invariant like \"an issued bill is immutable\" is otherwise enforced only inside the class that writes it, while `entity:<ns>/<E>.update` reaches the same row through the dispatcher and rewrites it past every guard in that class — enforcement at the caller, which is the anti-pattern the data layer exists to prevent. Frozen means frozen for the DOCUMENT, not for the whole row: a column left out of `freeze` stays writable, which is how a settlement can still be recorded against a bill whose totals are final.",
+      "required": ["onceSet", "freeze"],
+      "additionalProperties": false,
+      "properties": {
+        "onceSet": {
+          "type": "string",
+          "description": "The column whose non-null value SEALS the row. Must be a column this entity declares, and one that is null until the sealing act and never moved after it (`issuedAt`, `postedAt`, `closedAt`). A NOT NULL column with a default would seal every row on insert, so nothing could ever be drafted."
+        },
+        "freeze": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "description": "Columns that may not change once the row is sealed. Name every column carrying what the document ASSERTED — its totals, its number, its status, the parties it was issued against — and leave out whatever legitimately keeps moving afterwards. `onceSet` itself belongs here: a seal that can be re-stamped is not a seal."
+        }
+      }
     }
   },
   "additionalProperties": false,
   "definitions": {
+    "lookup": {
+      "type": "object",
+      "required": ["target"],
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-zA-Z][a-zA-Z0-9_-]*(/[a-zA-Z][a-zA-Z0-9_-]*)?$",
+          "description": "The entity this column points at. A bare name resolves within the declaring package's namespace; a `namespace/Entity` form is used as-is."
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What to call this relationship where it is shown (e.g. `outletId` → \"Outlet\"). Absent ⇒ consumers derive a label from the target entity's name."
+        }
+      }
+    },
     "column": {
       "type": "object",
       "required": ["type"],
@@ -98,7 +146,7 @@
         "nullable": { "type": "boolean" },
         "unique": { "type": "boolean" },
         "default": {
-          "description": "Column default. Strings ending in `()` (e.g. `now()`) emit as raw SQL; quoted strings (`'sent'`) unwrap to literals. Numbers / booleans pass through.",
+          "description": "Column default: null, a number, a boolean, a quoted literal (`'sent'`), a plain word, one of `now()`, `gen_random_uuid()`, `uuid_generate_v4()`, `current_timestamp`, or a quoted literal, number or boolean with a `::type` cast (`'{}'::jsonb`). A quote inside a value, any other function and any other cast are refused at install — a default is DDL.",
           "type": ["string", "number", "boolean", "null"]
         },
         "primary": { "type": "boolean" },
@@ -106,7 +154,19 @@
         "array": { "type": "boolean" },
         "enum": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
         "comment": { "type": "string" },
-        "transforms": { "$ref": "#/definitions/transformsBlock" }
+        "transforms": { "$ref": "#/definitions/transformsBlock" },
+        "renamedFrom": { "$ref": "#/definitions/renamedFrom" }
+      }
+    },
+    "renamedFrom": {
+      "description": "Packaged entities only: where this column's data comes from when a deck still has the column under the name a previous version gave it. Before every schema apply, a deck with the old column and not this one has it renamed — and, for `minor-units`, converted to whole minor units (`ROUND(old * 10^scale)`, e.g. 125.50 → 12550 at scale 2) — instead of TypeORM dropping it and adding this one empty. A deck with BOTH columns is refused. A fixed vocabulary, never SQL. The old name must not be another column of the entity; `minor-units` needs a bigint or integer column and a `scale`; `none` takes no `scale`.",
+      "type": "object",
+      "required": ["column", "convert"],
+      "additionalProperties": false,
+      "properties": {
+        "column": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,62}$" },
+        "convert": { "type": "string", "enum": ["none", "minor-units"] },
+        "scale": { "type": "integer", "minimum": 0, "maximum": 4 }
       }
     },
     "index": {

@@ -7,10 +7,11 @@
 import type { Capability } from './capability';
 import { CapabilityNotGrantedError, ReservedCapabilityError } from './errors';
 import { RuntimeGuard } from './guard';
+import { DECK_CODE_PACKAGE, DECK_CODE_PACKAGE_NAME } from './deck-code-identity';
 import { InMemoryGrantsRepository, type CapabilityAuditEntry, type GuardContext } from './ports';
 
 const tfg: GuardContext = {
-  tenantId: 'tfg',
+  deckId: 'tfg',
   tenantSlug: 'tfg',
   env: 'dev',
   packageName: 'standard/notify',
@@ -39,7 +40,7 @@ describe('RuntimeGuard.ensureGranted — ungranted throws CapabilityNotGrantedEr
     await expect(guard.ensureGranted('email:send', tfg)).rejects.toBeInstanceOf(CapabilityNotGrantedError);
   });
 
-  it('carries capability + packageName + tenantId on the error', async () => {
+  it('carries capability + packageName + deckId on the error', async () => {
     const repo = new InMemoryGrantsRepository();
     const guard = new RuntimeGuard({ repository: repo });
     try {
@@ -50,14 +51,14 @@ describe('RuntimeGuard.ensureGranted — ungranted throws CapabilityNotGrantedEr
       const e = err as CapabilityNotGrantedError;
       expect(e.capability).toBe('email:send');
       expect(e.packageName).toBe('standard/notify');
-      expect(e.tenantId).toBe('tfg');
+      expect(e.deckId).toBe('tfg');
     }
   });
 
   it('scopes by tenant — a grant on TFG does not satisfy ACME', async () => {
     const repo = new InMemoryGrantsRepository([{ ...tfg, capabilities: ['email:send'] }]);
     const guard = new RuntimeGuard({ repository: repo });
-    const acme = { ...tfg, tenantId: 'acme' };
+    const acme = { ...tfg, deckId: 'acme' };
     await expect(guard.ensureGranted('email:send', acme)).rejects.toBeInstanceOf(CapabilityNotGrantedError);
   });
 
@@ -127,11 +128,11 @@ describe('RuntimeGuard — caching', () => {
   it('invalidate(ctx) drops one entry without affecting others', async () => {
     const repo = new InMemoryGrantsRepository([
       { ...tfg, capabilities: ['email:send'] },
-      { ...tfg, tenantId: 'acme', capabilities: ['email:send'] }
+      { ...tfg, deckId: 'acme', capabilities: ['email:send'] }
     ]);
     const spy = jest.spyOn(repo, 'findGrants');
     const guard = new RuntimeGuard({ repository: repo });
-    const acme = { ...tfg, tenantId: 'acme' };
+    const acme = { ...tfg, deckId: 'acme' };
 
     await guard.ensureGranted('email:send', tfg);
     await guard.ensureGranted('email:send', acme);
@@ -211,7 +212,7 @@ describe('RuntimeGuard.ensureGranted — audit callback (§9.50 Slice 8)', () =>
     await guard.ensureGranted('email:send', tfg);
     expect(entries).toEqual([
       {
-        tenantId: 'tfg',
+        deckId: 'tfg',
         tenantSlug: 'tfg',
         env: 'dev',
         packageName: 'standard/notify',
@@ -230,7 +231,7 @@ describe('RuntimeGuard.ensureGranted — audit callback (§9.50 Slice 8)', () =>
     await expect(guard.ensureGranted('email:send', tfg)).rejects.toBeInstanceOf(CapabilityNotGrantedError);
     expect(entries).toHaveLength(1);
     expect(entries[0]).toEqual({
-      tenantId: 'tfg',
+      deckId: 'tfg',
       tenantSlug: 'tfg',
       env: 'dev',
       packageName: 'standard/notify',
@@ -295,5 +296,107 @@ describe('RuntimeGuard.ensureGranted — audit callback (§9.50 Slice 8)', () =>
       }
     });
     await expect(guard.ensureGranted('email:send', tfg)).rejects.toThrow('audit pipeline down');
+  });
+});
+
+/**
+ * §9.169 PR-10 — the parent-set capability CEILING is the first key, checked before any grant is read;
+ * the deck-code identity (`core/deck-code`) has no grants but the ceiling, and never reaches the repository.
+ */
+describe('RuntimeGuard.ensureGranted — §9.169 capability ceiling + deck-code identity', () => {
+  const deckCode: GuardContext = {
+    deckId: 'tfg',
+    tenantSlug: 'tfg',
+    env: 'dev',
+    packageName: DECK_CODE_PACKAGE_NAME,
+    packageVersion: DECK_CODE_PACKAGE.version
+  };
+
+  it('refuses a capability outside the ceiling WITHOUT touching the repository, audited not_granted', async () => {
+    const repo = new InMemoryGrantsRepository([{ ...tfg, capabilities: ['email:send'] }]);
+    const find = jest.spyOn(repo, 'findGrants');
+    const entries: CapabilityAuditEntry[] = [];
+    const guard = new RuntimeGuard({ repository: repo, auditCallback: (e) => entries.push(e) });
+    await expect(guard.ensureGranted('email:send', { ...tfg, capabilityCeiling: ['sms:send'] })).rejects.toBeInstanceOf(
+      CapabilityNotGrantedError
+    );
+    expect(find).not.toHaveBeenCalled();
+    expect(entries).toEqual([expect.objectContaining({ result: 'not_granted', errorCode: 'CAPABILITY_NOT_GRANTED' })]);
+  });
+
+  it('an EMPTY ceiling refuses everything — defined means enforced', async () => {
+    const repo = new InMemoryGrantsRepository([{ ...tfg, capabilities: ['email:send'] }]);
+    const find = jest.spyOn(repo, 'findGrants');
+    const guard = new RuntimeGuard({ repository: repo });
+    await expect(guard.ensureGranted('email:send', { ...tfg, capabilityCeiling: [] })).rejects.toBeInstanceOf(
+      CapabilityNotGrantedError
+    );
+    expect(find).not.toHaveBeenCalled();
+  });
+
+  it('a package identity needs BOTH the ceiling and the master grant; no ceiling leaves the grants alone', async () => {
+    const repo = new InMemoryGrantsRepository([{ ...tfg, capabilities: ['email:send'] }]);
+    const guard = new RuntimeGuard({ repository: repo, cacheTtlMs: 0 });
+    const ceiling = ['email:send', 'sms:send'];
+    await expect(guard.ensureGranted('email:send', { ...tfg, capabilityCeiling: ceiling })).resolves.toBeUndefined();
+    // Inside the ceiling, but no master grant → refused: the ceiling never widens a grant.
+    await expect(guard.ensureGranted('sms:send', { ...tfg, capabilityCeiling: ceiling })).rejects.toBeInstanceOf(
+      CapabilityNotGrantedError
+    );
+    await expect(guard.ensureGranted('email:send', tfg)).resolves.toBeUndefined();
+  });
+
+  it('the deck-code identity is granted from its ceiling with the repository NEVER called, audited granted', async () => {
+    const repo = new InMemoryGrantsRepository();
+    const find = jest.spyOn(repo, 'findGrants');
+    const entries: CapabilityAuditEntry[] = [];
+    const guard = new RuntimeGuard({ repository: repo, auditCallback: (e) => entries.push(e) });
+    await expect(
+      guard.ensureGranted('email:send', { ...deckCode, capabilityCeiling: ['email:send'] })
+    ).resolves.toBeUndefined();
+    expect(find).not.toHaveBeenCalled();
+    expect(entries).toEqual([
+      expect.objectContaining({ result: 'granted', packageName: 'core/deck-code', packageVersion: '0' })
+    ]);
+    // Outside its ceiling: refused, and still no repository read.
+    await expect(
+      guard.ensureGranted('sms:send', { ...deckCode, capabilityCeiling: ['email:send'] })
+    ).rejects.toBeInstanceOf(CapabilityNotGrantedError);
+    expect(find).not.toHaveBeenCalled();
+  });
+
+  it('the deck-code identity with NO ceiling is refused — a grant row for it would mean nothing', async () => {
+    // Even a (hypothetical) master grant row for the identity is never consulted.
+    const repo = new InMemoryGrantsRepository([{ ...deckCode, capabilities: ['email:send'] }]);
+    const find = jest.spyOn(repo, 'findGrants');
+    const entries: CapabilityAuditEntry[] = [];
+    const guard = new RuntimeGuard({ repository: repo, auditCallback: (e) => entries.push(e) });
+    await expect(guard.ensureGranted('email:send', deckCode)).rejects.toBeInstanceOf(CapabilityNotGrantedError);
+    expect(find).not.toHaveBeenCalled();
+    expect(entries).toEqual([expect.objectContaining({ result: 'not_granted', errorCode: 'CAPABILITY_NOT_GRANTED' })]);
+  });
+
+  it('a reserved capability is refused FIRST, even when the ceiling names it', async () => {
+    const repo = new InMemoryGrantsRepository();
+    const find = jest.spyOn(repo, 'findGrants');
+    const entries: CapabilityAuditEntry[] = [];
+    const guard = new RuntimeGuard({ repository: repo, auditCallback: (e) => entries.push(e) });
+    await expect(
+      guard.ensureGranted('event:emit' as Capability, { ...deckCode, capabilityCeiling: ['event:emit'] })
+    ).rejects.toBeInstanceOf(ReservedCapabilityError);
+    expect(find).not.toHaveBeenCalled();
+    expect(entries).toEqual([expect.objectContaining({ result: 'reserved' })]);
+  });
+
+  it('isDeckCodeIdentity is an exact-name test: a package in another namespace named deck-code is not it', async () => {
+    const repo = new InMemoryGrantsRepository();
+    const find = jest.spyOn(repo, 'findGrants');
+    const guard = new RuntimeGuard({ repository: repo });
+    const lookalike: GuardContext = { ...deckCode, packageName: 'standard/deck-code' };
+    await expect(
+      guard.ensureGranted('email:send', { ...lookalike, capabilityCeiling: ['email:send'] })
+    ).rejects.toBeInstanceOf(CapabilityNotGrantedError);
+    // A package identity: the grants WERE read (and hold nothing).
+    expect(find).toHaveBeenCalledTimes(1);
   });
 });

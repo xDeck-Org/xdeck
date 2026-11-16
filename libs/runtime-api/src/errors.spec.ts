@@ -14,14 +14,14 @@ import {
 } from './errors';
 
 describe('CapabilityNotGrantedError', () => {
-  it('carries capability + packageName + tenantId in the message + as fields', () => {
+  it('carries capability + packageName + deckId in the message + as fields', () => {
     const err = new CapabilityNotGrantedError('email:send', 'standard/notify', 'tfg');
     expect(err).toBeInstanceOf(RuntimeApiError);
     expect(err).toBeInstanceOf(Error);
     expect(err.code).toBe('CAPABILITY_NOT_GRANTED');
     expect(err.capability).toBe('email:send');
     expect(err.packageName).toBe('standard/notify');
-    expect(err.tenantId).toBe('tfg');
+    expect(err.deckId).toBe('tfg');
     expect(err.message).toMatch(/email:send/);
     expect(err.message).toMatch(/standard\/notify/);
     expect(err.message).toMatch(/tfg/);
@@ -60,13 +60,13 @@ describe('PlanCapabilityMismatchError', () => {
 });
 
 describe('BudgetExceededError', () => {
-  it('carries packageName + tenantId + capInr + currentInr + renders the message', () => {
+  it('carries packageName + deckId + capInr + currentInr + renders the message', () => {
     const err = new BudgetExceededError('standard/ai-assistant', 'tfg', 5000, 5234.56);
     expect(err).toBeInstanceOf(RuntimeApiError);
     expect(err).toBeInstanceOf(Error);
     expect(err.code).toBe('BUDGET_EXCEEDED');
     expect(err.packageName).toBe('standard/ai-assistant');
-    expect(err.tenantId).toBe('tfg');
+    expect(err.deckId).toBe('tfg');
     expect(err.capInr).toBe(5000);
     expect(err.currentInr).toBe(5234.56);
     /* The message includes both the numerator + denominator so an

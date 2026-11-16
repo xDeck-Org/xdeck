@@ -6,17 +6,21 @@
  * unrestricted; RELEASING one is gated on test coverage ≥ threshold.
  *
  * Salesforce blocks an Apex deploy below 75% org coverage; xDeck blocks a
- * package / tenant RELEASE below the platform standard already enforced on the
- * backend core in `.github/workflows/coverage-check.yml`:
+ * package / tenant RELEASE below the platform standard, the bar the backend's shared
+ * layer is held to by its own unit run (jest `coverageThreshold`, apps/backend/package.json;
+ * the rest of the backend is on a ratchet just under it since 2026-10-17):
  *
  *     statements ≥ 80   branches ≥ 75   functions ≥ 80   lines ≥ 80
  *
  * This is the ONE primitive behind every release gate (one rule, N call sites):
  *   - package release  → `package-release.yml` runs it over the
  *                        package's own unit tests, scoped to the package tree.
- *   - tenant  release  → `tenant-release.yml` runs it over the tenant's tests,
- *                        scoped to `tenants/<slug>/`.
- *   - backend core     → `coverage-check.yml` (can delegate here too).
+ *   - deck    release  → a deck repo's own release workflow can run it over the deck's
+ *                        tests (the monorepo's `tenant-release.yml` did, until the deck
+ *                        folders left this repo and that workflow was removed).
+ *   - backend          → not through this script: jest judges every key of the backend's
+ *                        `coverageThreshold` itself on every `npm run test:cov`, and the
+ *                        chunked runner judges the same keys the same way.
  *
  * Reads an Istanbul / jest `coverage-summary.json`. With `--scope <substr>` it
  * re-aggregates only the file entries whose path contains <substr>, so a single
@@ -30,7 +34,7 @@
  *
  * Usage:
  *   node scripts/ci/coverage-gate.js --coverage-summary coverage/coverage-summary.json
- *   node scripts/ci/coverage-gate.js --coverage-summary <p> --scope packages/standard/approvals --target <dir>
+ *   node scripts/ci/coverage-gate.js --coverage-summary <p> --scope xdeck-pkg-approvals --target <dir>
  *   node scripts/ci/coverage-gate.js --coverage-summary <p> --statements 85 --branches 80
  *   node scripts/ci/coverage-gate.js --coverage-summary <p> --json
  *
@@ -43,7 +47,7 @@
 const fs = require('fs');
 const path = require('path');
 
-// Platform standard — identical to coverage-check.yml so a package/tenant is
+// Platform standard — the bar the backend's shared-layer folders are held to, so a package/tenant is
 // held to the same bar as the core it runs inside. Override per-metric via flags.
 const DEFAULT_THRESHOLDS = { statements: 80, branches: 75, functions: 80, lines: 80 };
 const METRICS = ['statements', 'branches', 'functions', 'lines'];
@@ -58,7 +62,8 @@ const METRICS = ['statements', 'branches', 'functions', 'lines'];
 function pctOf(entry) {
   if (!entry) return null;
   if (typeof entry.pct === 'number') return entry.pct;
-  if (typeof entry.total === 'number') return entry.total === 0 ? 100 : Number(((entry.covered / entry.total) * 100).toFixed(2));
+  if (typeof entry.total === 'number')
+    return entry.total === 0 ? 100 : Number(((entry.covered / entry.total) * 100).toFixed(2));
   return null;
 }
 
@@ -108,7 +113,9 @@ function evaluateCoverage(totals, opts = {}) {
       dataOnly: true,
       thresholds,
       totals: null,
-      failures: hasE2e ? [] : [{ metric: 'e2e', reason: 'no code AND no e2e install test — nothing proves this releases cleanly' }],
+      failures: hasE2e
+        ? []
+        : [{ metric: 'e2e', reason: 'no code AND no e2e install test — nothing proves this releases cleanly' }],
       reason: hasE2e
         ? 'data-only target — no code to cover; release proven by the e2e install round-trip'
         : 'data-only target with NO e2e install test — release blocked'
@@ -197,11 +204,18 @@ function main(argv) {
         dataOnly: false,
         thresholds: { ...DEFAULT_THRESHOLDS, ...(args.thresholds || {}) },
         totals: null,
-        failures: [{ metric: 'coverage', reason: 'code present but no coverage report — run tests with --coverage before release' }],
+        failures: [
+          {
+            metric: 'coverage',
+            reason: 'code present but no coverage report — run tests with --coverage before release'
+          }
+        ],
         reason: 'code present but no coverage report was produced'
       };
     } else {
-      process.stderr.write('coverage-gate: provide --coverage-summary <path>, or --target <dir> to detect a data-only release.\n');
+      process.stderr.write(
+        'coverage-gate: provide --coverage-summary <path>, or --target <dir> to detect a data-only release.\n'
+      );
       process.exitCode = 2;
       return;
     }
@@ -228,7 +242,9 @@ function report(result, label, totals, args) {
   if (args.json) {
     process.stdout.write(`${JSON.stringify({ label, ...result }, null, 2)}\n`);
   } else {
-    process.stdout.write(`Coverage gate — ${label} (thresholds: ${METRICS.map((m) => `${m}≥${result.thresholds[m]}`).join(' ')})\n`);
+    process.stdout.write(
+      `Coverage gate — ${label} (thresholds: ${METRICS.map((m) => `${m}≥${result.thresholds[m]}`).join(' ')})\n`
+    );
     if (result.dataOnly) {
       process.stdout.write(`  ${result.pass ? '✅' : '❌'} ${result.reason}\n`);
     } else if (totals) {
@@ -240,7 +256,9 @@ function report(result, label, totals, args) {
       }
     }
     if (!result.pass) {
-      process.stdout.write(`\n❌ RELEASE BLOCKED — ${result.reason}. Raise coverage to the threshold (or add an e2e install test) before tagging.\n`);
+      process.stdout.write(
+        `\n❌ RELEASE BLOCKED — ${result.reason}. Raise coverage to the threshold (or add an e2e install test) before tagging.\n`
+      );
     } else {
       process.stdout.write(`\n✅ Release gate passes.\n`);
     }

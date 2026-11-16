@@ -9,7 +9,18 @@
  */
 
 import { CapabilityNotGrantedError, ReservedCapabilityError } from './errors';
+import { XDECK_METHOD_MAP } from './method-mapping';
 import { mockTenantRuntime } from './testing';
+
+describe('mockTenantRuntime — the integrator door is identity-scoped (§9.169 PR-10)', () => {
+  it('callout answers a stub ok and settings an empty object, with no grant configured', async () => {
+    const xd = mockTenantRuntime({ granted: [] });
+    await expect(
+      xd.integrator.callout({ connector: '0b7c1a9e-5d2f-4e8a-9c3b-1f6d2e7a8b90', method: 'GET', path: '/items' })
+    ).resolves.toMatchObject({ outcome: 'ok', status: 200, body: null });
+    await expect(xd.integrator.settings()).resolves.toEqual({});
+  });
+});
 
 describe('mockTenantRuntime — granted capabilities', () => {
   it('lets a granted static capability through to its jest.fn', async () => {
@@ -70,7 +81,7 @@ describe('mockTenantRuntime — ungranted capabilities throw CapabilityNotGrante
     const xd = mockTenantRuntime({
       granted: [],
       packageName: 'standard/notify',
-      context: { tenantId: 'acme' }
+      context: { deckId: 'acme' }
     });
     try {
       xd.email.send({ to: 'u@x', subject: 's', templateId: 't', data: {} });
@@ -80,7 +91,7 @@ describe('mockTenantRuntime — ungranted capabilities throw CapabilityNotGrante
       const e = err as CapabilityNotGrantedError;
       expect(e.capability).toBe('email:send');
       expect(e.packageName).toBe('standard/notify');
-      expect(e.tenantId).toBe('acme');
+      expect(e.deckId).toBe('acme');
       expect(e.code).toBe('CAPABILITY_NOT_GRANTED');
     }
   });
@@ -96,7 +107,9 @@ describe('mockTenantRuntime — ungranted capabilities throw CapabilityNotGrante
     const xd = mockTenantRuntime({ granted: [] });
     expect(() => xd.email.send({ to: 'u@x', subject: 's', templateId: 't', data: {} })).toThrow();
     expect(() => xd.notification.send({ userId: 'u', variant: 'toast', body: {} })).toThrow();
-    expect(() => xd.payment.initiate({ amount: 1, currency: 'INR', idempotencyKey: 'k' })).toThrow();
+    expect(() => xd.payment.initiate({ gateway: 'cash', amountMinor: 1, currency: 'INR', reference: 'k' })).toThrow();
+    // §9.171 L3 — the gateways list is behind the same initiate gate.
+    expect(() => xd.payment.gateways()).toThrow();
   });
 });
 
@@ -134,7 +147,7 @@ describe('mockTenantRuntime — reserved capabilities throw ReservedCapabilityEr
 describe('mockTenantRuntime — context + peek', () => {
   it('fills sensible defaults for context (tfg / dev / test mock-package)', () => {
     const xd = mockTenantRuntime({ granted: [] });
-    expect(xd.context.tenantId).toBe('tfg');
+    expect(xd.context.deckId).toBe('tfg');
     expect(xd.context.env).toBe('dev');
     expect(xd.context.package.namespace).toBe('test');
     expect(xd.context.package.name).toBe('mock-package');
@@ -145,7 +158,7 @@ describe('mockTenantRuntime — context + peek', () => {
     const xd = mockTenantRuntime({
       granted: [],
       context: {
-        tenantId: 'acme',
+        deckId: 'acme',
         tenantSlug: 'acme-corp',
         env: 'prod',
         package: { namespace: 'acme-builder', name: 'refund-flow', version: '1.2.3' },
@@ -153,7 +166,7 @@ describe('mockTenantRuntime — context + peek', () => {
         spanId: 's-real'
       }
     });
-    expect(xd.context.tenantId).toBe('acme');
+    expect(xd.context.deckId).toBe('acme');
     expect(xd.context.tenantSlug).toBe('acme-corp');
     expect(xd.context.env).toBe('prod');
     expect(xd.context.package).toEqual({
@@ -205,5 +218,72 @@ describe('mockTenantRuntime — jest mock surface', () => {
     // wrapper. Asserting the call count gives the consumer signal that
     // the package code attempted the call even though it was denied.
     expect(xd.email.send).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('mockTenantRuntime — §9.166 the invoice ledger', () => {
+  it('serves exactly the invoice methods the kernel serves — no more, no fewer', () => {
+    const xd = mockTenantRuntime({ granted: [] });
+    const mapped = Object.keys(XDECK_METHOD_MAP)
+      .filter((m) => m.startsWith('invoice.'))
+      .map((m) => m.slice('invoice.'.length))
+      .sort();
+    expect(Object.keys(xd.invoice).sort()).toEqual(mapped);
+  });
+
+  it('each method checks the package key the method map names', () => {
+    const xd = mockTenantRuntime({ granted: ['invoice:issue'] });
+    expect(() => xd.invoice.issue({ idempotencyKey: 'k:1:1', lines: [] })).not.toThrow();
+    // …and a different key is a different grant.
+    expect(() =>
+      xd.invoice.recordTender({ invoiceId: 'i', tenderKindCode: 'cash', amountMinor: 1, idempotencyKey: 'k:2:1' })
+    ).toThrow(CapabilityNotGrantedError);
+  });
+
+  it('collectOnline needs BOTH keys, exactly like the real door', () => {
+    const settleOnly = mockTenantRuntime({ granted: ['invoice:settle'] });
+    let err: unknown;
+    try {
+      settleOnly.invoice.collectOnline({
+        invoiceId: 'i-1',
+        amountMinor: 1,
+        gateway: 'razorpay',
+        returnUrl: 'https://d.test/r',
+        idempotencyKey: 'k'
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(CapabilityNotGrantedError);
+    expect((err as CapabilityNotGrantedError).capability).toBe('payment:initiate');
+
+    const both = mockTenantRuntime({ granted: ['invoice:settle', 'payment:initiate'] });
+    expect(() =>
+      both.invoice.collectOnline({
+        invoiceId: 'i-1',
+        amountMinor: 1,
+        gateway: 'razorpay',
+        returnUrl: 'https://d.test/r',
+        idempotencyKey: 'k'
+      })
+    ).not.toThrow();
+  });
+});
+
+describe('mockTenantRuntime — the plane a package runs on (D-10-0b)', () => {
+  it('defaults to the cloud, as a host off an appliance sets it', () => {
+    const xd = mockTenantRuntime({ granted: [] });
+    expect(xd.context.plane).toBe('cloud');
+  });
+
+  it('takes an override, so a package test can model an on-site appliance', () => {
+    const xd = mockTenantRuntime({ granted: [], context: { plane: 'appliance' } });
+    expect(xd.context.plane).toBe('appliance');
+  });
+
+  it('the override moves nothing else in the context', () => {
+    const plain = mockTenantRuntime({ granted: [] });
+    const box = mockTenantRuntime({ granted: [], context: { plane: 'appliance' } });
+    expect({ ...box.context, plane: 'cloud' }).toEqual(plain.context);
   });
 });

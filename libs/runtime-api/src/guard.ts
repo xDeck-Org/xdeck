@@ -7,7 +7,7 @@
  *
  * Why this is its own object (not a free function):
  *  - **Caching** — grant sets are hot-path-read. The guard caches by
- *    (tenantId, packageName, packageVersion) with a short TTL so the
+ *    (deckId, packageName, packageVersion) with a short TTL so the
  *    grants table doesn't take 10k req/s. Cache lives on the instance,
  *    not module-level — multiple hosts in the same process don't share
  *    state.
@@ -20,6 +20,7 @@
 
 import { ensureNotReserved, type Capability } from './capability';
 import { CapabilityNotGrantedError, ReservedCapabilityError } from './errors';
+import { isDeckCodeIdentity } from './deck-code-identity';
 import type { CapabilityAuditCallback, GrantsRepository, GuardContext } from './ports';
 
 /**
@@ -28,7 +29,7 @@ import type { CapabilityAuditCallback, GrantsRepository, GuardContext } from './
  * that don't carry `tenantSlug` / `env` can call invalidate without
  * fabricating values. A full {@link GuardContext} is assignable.
  */
-export type InvalidateKey = Pick<GuardContext, 'tenantId' | 'packageName' | 'packageVersion'>;
+export type InvalidateKey = Pick<GuardContext, 'deckId' | 'packageName' | 'packageVersion'>;
 
 export interface RuntimeGuardOptions {
   /** Adapter the guard reads grants from. Required. */
@@ -64,7 +65,7 @@ export class RuntimeGuard {
   private readonly cacheTtlMs: number;
   private readonly clock: () => number;
   private readonly auditCallback?: CapabilityAuditCallback;
-  // Key: `${tenantId}|${packageName}|${packageVersion}` (same shape as ports).
+  // Key: `${deckId}|${packageName}|${packageVersion}` (same shape as ports).
   private readonly cache = new Map<string, CacheEntry>();
 
   constructor(options: RuntimeGuardOptions) {
@@ -82,6 +83,14 @@ export class RuntimeGuard {
    * FIRST so the operator sees the more specific reason even if the
    * grant table somehow had a stale row for a now-reserved capability.
    *
+   * §9.169 PR-10 — when the PARENT set a {@link GuardContext.capabilityCeiling} for this call, a
+   * capability outside it is refused NEXT, before any grant is read: the ceiling is the first key
+   * and the grant table cannot widen it. The deck-code identity (`core/deck-code`, see
+   * {@link isDeckCodeIdentity}) has no grants but the ceiling — with one that holds the capability
+   * it is granted, with none it is refused — and the repository and the cache are never consulted
+   * for it (the cache is keyed by identity, and every handler run on the deck shares this one).
+   * Every other identity must hold BOTH the ceiling and the master grant.
+   *
    * Resolves with `void` on success — caller proceeds with the wrapped
    * `xdeck.*` call.
    *
@@ -98,12 +107,27 @@ export class RuntimeGuard {
       }
       throw err;
     }
-    const grants = await this.loadGrants(ctx);
-    if (!grants.has(capability)) {
-      this.emitAudit(capability, ctx, 'not_granted', 'CAPABILITY_NOT_GRANTED');
-      throw new CapabilityNotGrantedError(capability, ctx.packageName, ctx.tenantId);
+    // §9.169 PR-10 — the ceiling: exact string equality, as the grant set compares. Checked before
+    // any grant is read, so a refused capability never costs a repository round trip either.
+    if (ctx.capabilityCeiling !== undefined && !ctx.capabilityCeiling.includes(capability)) {
+      this.refuseNotGranted(capability, ctx);
     }
+    // A deck's own code: the ceiling IS the grant set. No ceiling, no grant; and never `loadGrants`
+    // (the cache key is per identity, which every handler on the deck shares).
+    if (isDeckCodeIdentity(ctx)) {
+      if (ctx.capabilityCeiling === undefined) this.refuseNotGranted(capability, ctx);
+      this.emitAudit(capability, ctx, 'granted');
+      return;
+    }
+    const grants = await this.loadGrants(ctx);
+    if (!grants.has(capability)) this.refuseNotGranted(capability, ctx);
     this.emitAudit(capability, ctx, 'granted');
+  }
+
+  /** The one `not_granted` refusal — audited, then thrown. */
+  private refuseNotGranted(capability: Capability, ctx: GuardContext): never {
+    this.emitAudit(capability, ctx, 'not_granted', 'CAPABILITY_NOT_GRANTED');
+    throw new CapabilityNotGrantedError(capability, ctx.packageName, ctx.deckId);
   }
 
   private emitAudit(
@@ -114,19 +138,21 @@ export class RuntimeGuard {
   ): void {
     if (!this.auditCallback) return;
     this.auditCallback({
-      tenantId: ctx.tenantId,
+      deckId: ctx.deckId,
       tenantSlug: ctx.tenantSlug,
       env: ctx.env,
       packageName: ctx.packageName,
       packageVersion: ctx.packageVersion,
       capability,
       result,
-      errorCode
+      errorCode,
+      // §9.94 B5.c — per-user audit attribution when a verified actor is present.
+      actorUserId: ctx.actor?.userId
     });
   }
 
   /**
-   * Drop the cache entry for (tenantId, packageName, packageVersion).
+   * Drop the cache entry for (deckId, packageName, packageVersion).
    * Host calls this when the admin grants / revokes a capability or
    * when the package version changes. Other entries unaffected.
    *
@@ -158,6 +184,6 @@ export class RuntimeGuard {
   }
 
   private key(ctx: InvalidateKey): string {
-    return `${ctx.tenantId}|${ctx.packageName}|${ctx.packageVersion}`;
+    return `${ctx.deckId}|${ctx.packageName}|${ctx.packageVersion}`;
   }
 }

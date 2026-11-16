@@ -28,6 +28,40 @@
 
 import { CapabilityNotGrantedError } from './errors';
 import { ensureNotReserved, type Capability } from './capability';
+import { capabilitiesForMethodCall } from './method-mapping';
+import type { InvoiceAPI } from './invoice';
+
+export {
+  INVOICE_DOUBLE_IDEMPOTENCY_KEY_RE,
+  INVOICE_DOUBLE_NOT_MODELLED,
+  INVOICE_DOUBLE_REFUSAL_CODES,
+  INVOICE_DOUBLE_TENDER_KINDS,
+  INVOICE_DOUBLE_VOID_REASONS,
+  createInMemoryInvoiceLedger,
+  type InMemoryInvoiceLedger,
+  type InMemoryInvoiceLedgerOptions
+} from './invoice-double';
+
+/** Every `xdeck.invoice.<method>` the kernel serves today (the method map is the source). */
+const INVOICE_METHODS = [
+  'quote',
+  'issue',
+  'get',
+  'list',
+  'changes',
+  'summary',
+  // §9.166 part 12b-p — one invoice's payments.
+  'payments',
+  'recordTender',
+  'reconcileTender',
+  'void',
+  'credit',
+  'recordOfflineRefund',
+  'collectOnline',
+  'confirmPayment',
+  // §9.166 cluster 6 — money OUT through the gateway that captured it.
+  'refund'
+] as const;
 import type { XDeckContext, XDeckRuntime } from './runtime';
 
 export interface MockTenantRuntimeOptions {
@@ -55,6 +89,13 @@ export interface MockTenantRuntimeOptions {
    * the guard throws. Defaults to `'test/mock-package'`.
    */
   packageName?: string;
+  /**
+   * §9.166 — a ledger for `xdeck.invoice` to delegate to AFTER the capability check, so a
+   * test exercises both the declaration and the ledger's behaviour. Usually
+   * {@link createInMemoryInvoiceLedger}. Absent ⇒ invoice methods resolve `undefined`
+   * like every other mock.
+   */
+  invoiceLedger?: InvoiceAPI;
 }
 
 /**
@@ -82,7 +123,7 @@ export function mockTenantRuntime(
   const granted = new Set<Capability>(options.granted);
   const quotas = { ...(options.quotas ?? {}) };
   const packageName = options.packageName ?? 'test/mock-package';
-  const tenantId = options.context?.tenantId ?? 'tfg';
+  const deckId = options.context?.deckId ?? 'tfg';
 
   // Guard: every method routes through this before invoking its jest.fn.
   // Reservation check fires FIRST so the test sees the reservation error
@@ -91,7 +132,7 @@ export function mockTenantRuntime(
   const ensureGranted = (capability: Capability): void => {
     ensureNotReserved(capability);
     if (!granted.has(capability)) {
-      throw new CapabilityNotGrantedError(capability, packageName, tenantId);
+      throw new CapabilityNotGrantedError(capability, packageName, deckId);
     }
   };
 
@@ -105,6 +146,15 @@ export function mockTenantRuntime(
       return undefined;
     });
   };
+  // §9.166 — a method that needs SEVERAL package keys (invoice.collectOnline needs
+  // invoice:settle AND payment:initiate). Each is checked in order, exactly as the host
+  // wrapper checks them, so a test with half the declaration fails here — not in production.
+  const mockComposed = (capabilities: readonly Capability[]): jest.Mock => {
+    return jest.fn(() => {
+      for (const capability of capabilities) ensureGranted(capability);
+      return undefined;
+    });
+  };
   const mockDynamic = <P>(capabilityOf: (payload: P) => Capability): jest.Mock => {
     return jest.fn((payload: P) => {
       ensureGranted(capabilityOf(payload));
@@ -113,12 +163,14 @@ export function mockTenantRuntime(
   };
 
   const context: XDeckContext = {
-    tenantId,
-    tenantSlug: options.context?.tenantSlug ?? tenantId,
+    deckId,
+    tenantSlug: options.context?.tenantSlug ?? deckId,
     env: options.context?.env ?? 'dev',
     package: options.context?.package ?? { namespace: 'test', name: 'mock-package', version: '0.0.0' },
     traceId: options.context?.traceId ?? 't-mock',
-    spanId: options.context?.spanId ?? 's-mock'
+    spanId: options.context?.spanId ?? 's-mock',
+    // A package's tests run on the cloud unless they say otherwise; `context: { plane: 'appliance' }` models a box.
+    plane: options.context?.plane ?? 'cloud'
   };
 
   const runtime = {
@@ -140,7 +192,9 @@ export function mockTenantRuntime(
     entity: {
       // Parameterized — derive the capability string from payload.entityName.
       read: mockDynamic((p: { entityName: string }) => `entity:read:${p.entityName}` as Capability),
-      write: mockDynamic((p: { entityName: string }) => `entity:write:${p.entityName}` as Capability)
+      write: mockDynamic((p: { entityName: string }) => `entity:write:${p.entityName}` as Capability),
+      // ADR-0035 — static: the record type is bounded by the delegation, not the manifest.
+      readAs: mockStatic('entity:read-delegated')
     },
     class: {
       // Reserved per §9.50.9.1 — always throws ReservedCapabilityError
@@ -166,7 +220,51 @@ export function mockTenantRuntime(
     secret: {
       read: mockDynamic((p: { key: string }) => `secret:read:${p.key}` as Capability)
     },
-    payment: { initiate: mockStatic('payment:initiate') },
+    payment: {
+      initiate: mockStatic('payment:initiate'),
+      // §9.67.3 PR-0b-ii — status shares the initiate gate (read-only, same domain).
+      status: mockStatic('payment:initiate'),
+      // §9.171 L3 — the gateways list shares the initiate gate too.
+      gateways: mockStatic('payment:initiate')
+    },
+    binding: {
+      // §9.82.2 PR-3 — parameterized per binding kind.
+      sign: mockDynamic((p: { kind: string }) => `binding:sign:${p.kind}` as Capability),
+      verify: mockDynamic((p: { kind: string }) => `binding:verify:${p.kind}` as Capability)
+    },
+    // §9.166 Step 6 — the invoice ledger. The capability each method checks is read from
+    // XDECK_METHOD_MAP, so this mock and the real door cannot disagree about which key a
+    // method needs. Resolves `undefined` like every other mock; a package that needs real
+    // ledger behaviour (numbering, idempotency, over-application) uses the invoice double.
+    invoice: Object.fromEntries(
+      INVOICE_METHODS.map((m) => {
+        const caps = capabilitiesForMethodCall(`invoice.${m}`) as Capability[];
+        const ledger = options.invoiceLedger;
+        if (!ledger) return [m, mockComposed(caps)];
+        // Keys first, then the ledger — the order the real door uses.
+        return [
+          m,
+          jest.fn((payload: unknown) => {
+            for (const capability of caps) ensureGranted(capability);
+            return (ledger[m] as (p: unknown) => Promise<unknown>)(payload);
+          })
+        ];
+      })
+    ),
+    // §9.169 PR-10 — the integrator door. Identity-scoped (no grant): the real door takes its authority
+    // from the handler run the parent set, which a unit test has no part in, so the mock answers a stub
+    // `ok` and empty settings. A handler test that needs a partner's answer overrides these two mocks.
+    integrator: {
+      callout: jest.fn(async () => ({
+        outcome: 'ok',
+        status: 200,
+        headers: {},
+        body: null,
+        attempts: 1,
+        retryAfterSeconds: null
+      })),
+      settings: jest.fn(async () => ({}))
+    },
     context,
     __peek(): MockTenantRuntimePeek {
       return { granted: new Set(granted), quotas: { ...quotas }, packageName };

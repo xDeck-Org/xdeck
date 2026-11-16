@@ -24,11 +24,15 @@ describe('XDeckRuntime', () => {
     ai: {
       complete: jest.fn(),
       embed: jest.fn(),
+      // §9.158 — AIAPI gained digestBuild when the digest slice shipped. It is REQUIRED on the
+      // interface, so omitting it here did not merely weaken the mock: this spec stopped
+      // compiling (TS2741) and the workspace verified nothing until it was noticed.
+      digestBuild: jest.fn(),
       agentInvoke: jest.fn(),
       knowledgeQuery: jest.fn()
     },
     template: { render: jest.fn() },
-    entity: { read: jest.fn(), write: jest.fn() },
+    entity: { read: jest.fn(), write: jest.fn(), readAs: jest.fn() },
     class: { invoke: jest.fn() },
     job: { schedule: jest.fn(), enqueue: jest.fn() },
     event: { emit: jest.fn(), listen: jest.fn() },
@@ -36,9 +40,34 @@ describe('XDeckRuntime', () => {
     webhook: { send: jest.fn() },
     storage: { read: jest.fn(), write: jest.fn() },
     secret: { read: jest.fn() },
-    payment: { initiate: jest.fn() },
+    payment: { initiate: jest.fn(), status: jest.fn(), refund: jest.fn(), gateways: jest.fn() },
+    binding: { sign: jest.fn(), verify: jest.fn() },
+    telemetry: { track: jest.fn(), identify: jest.fn(), page: jest.fn() },
+    // §9.146 — vertical-neutral §9.61 consumer-link primitive.
+    consumer: { ensureLink: jest.fn(), assertDependant: jest.fn(), updateOwnProfile: jest.fn() },
+    config: { get: jest.fn() },
+    // §9.169 PR-10 — an integration handler's door (identity-scoped: the parent-set run).
+    integrator: { callout: jest.fn(), settings: jest.fn() },
+    // §9.166 Step 6 — the deck↔consumer invoice ledger.
+    invoice: {
+      quote: jest.fn(),
+      issue: jest.fn(),
+      get: jest.fn(),
+      list: jest.fn(),
+      changes: jest.fn(),
+      summary: jest.fn(),
+      payments: jest.fn(),
+      recordTender: jest.fn(),
+      reconcileTender: jest.fn(),
+      void: jest.fn(),
+      credit: jest.fn(),
+      recordOfflineRefund: jest.fn(),
+      collectOnline: jest.fn(),
+      confirmPayment: jest.fn(),
+      refund: jest.fn()
+    },
     context: {
-      tenantId: 'tfg',
+      deckId: 'tfg',
       tenantSlug: 'tfg',
       env: 'dev' as const,
       package: { namespace: 'standard', name: 'notify', version: '1.0.0' },
@@ -47,17 +76,26 @@ describe('XDeckRuntime', () => {
     }
   } satisfies XDeckRuntime;
 
-  it('declares all 17 expected top-level domains + context', () => {
+  it('declares all 23 expected top-level domains + context', () => {
     const keys = Object.keys(stub).sort();
     expect(keys).toEqual(
       [
         'ai',
+        'binding',
         'class',
+        // §9.52 — own-install settings reader (identity-scoped, no capability)
+        'config',
+        // §9.146 — vertical-neutral §9.61 consumer-link primitive
+        'consumer',
         'context',
         'email',
         'entity',
         'event',
         'http',
+        // §9.169 PR-10 — the integrator door (identity-scoped, no capability)
+        'integrator',
+        // §9.166 Step 6 — the deck invoice ledger
+        'invoice',
         'job',
         'notification',
         'payment',
@@ -65,6 +103,7 @@ describe('XDeckRuntime', () => {
         'secret',
         'sms',
         'storage',
+        'telemetry',
         'template',
         'webhook',
         'whatsapp'
@@ -73,7 +112,7 @@ describe('XDeckRuntime', () => {
   });
 
   it('context carries tenant + env + package + trace fields', () => {
-    expect(stub.context.tenantId).toBe('tfg');
+    expect(stub.context.deckId).toBe('tfg');
     expect(stub.context.env).toMatch(/dev|uat|prod/);
     expect(stub.context.package.namespace).toBe('standard');
     expect(stub.context.traceId).toBe('t-1');
